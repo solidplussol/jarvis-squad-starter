@@ -1,0 +1,125 @@
+MODIFICATIONS to obsidian-jarvis-ui (vendored in jarvis-squad-starter)
+=======================================================================
+
+Upstream:  https://github.com/Prompt-Surfer/obsidian-jarvis-ui
+Tag:       v2.20.6
+Commit:    0d2eca1ff19d896e0f558184416574ffcde4389c
+License:   AGPL-3.0-only. LICENSE is unmodified (git blob be3f7b28e564e7dd05eaf59d64adba1a4065ac0e)
+           and all upstream copyright/SPDX notices are preserved.
+
+Upstream discrepancy (recorded, NOT fixed): package.json declares version
+2.16.1 although the tag/commit above is v2.20.6.
+
+Date of modification: 2026-11-07
+Purpose: "project-only isolation" mode, enabled with JARVIS_PROJECT_MODE=1.
+Outside that mode upstream behaviour is intended to be unchanged.
+Each changed or new source file carries a "MODIFIED 2026-11-07 for jarvis-squad-starter
+project-only isolation" notice (a few trivially small edits, e.g.
+vite-env.d.ts, carry it only here).
+
+New files
+  server/config.ts           shared resolver (mode, vault, ports, allowed roots, Vite options)
+  server/content-path.ts     single content-path policy (realpath/relative containment, lstat per component)
+  server/request-guard.ts    pure Host/Origin/method/CORS/CSP/HTML-transform logic
+  server/agents-roster.ts    read-only Agents roster: own fixed allow-list (.squad/team.md, casting/registry.json,
+                             identity/now.md, agents/<5 specialists>/charter.md), lstat/realpath containment,
+                             capped plain-text fields; never emits "running" (no live-status interface exists).
+                             Also allow-lists docs/status/<5 specialists>.md (format: docs/status/README.md);
+                             tolerant parser, latest-20 cap; "last_reported" only from a valid saved entry
+                             Status-record milestone: 5 new allow-listed docs/status/<agent>.md records
+                             (13 allow-listed files total); format in docs/status/README.md.
+                             State rules: last_reported for saved updates, running never emitted.
+                             Entries whose Reported time is >5 min in the future are skipped.
+                             Sanitiser keeps _ and * (no markdown stripping) but strips zero-width and
+                             bidi control characters.
+  src/components/AgentsPanel.tsx  read-only Mission view (project mode only): AGENT SQUAD roster | TASK PIPELINE |
+                             RECORDED UPDATES (not live) + Agent details tab; owns both the AGENTS and KANBAN
+                             buttons; one GET /api/agents on open/manual Refresh. Restyled 2026-11-07 (UI only).
+  tests/isolation/agents-roster.test.mjs  roster/allow-list/state-label/endpoint guard tests
+  src/components/KanbanPanel.tsx  read-only TASK PIPELINE component + shared theme (no fetch; App mounts only AgentsPanel; `kanban` from GET /api/agents; derived in
+                             server/agents-roster.ts buildKanban from the same status records)
+  tests/isolation/kanban.test.mjs  kanban grouping/column/retrospective/cap tests
+  src/lib/projectMode.ts     frontend flag from build-time define
+  tests/isolation/_helpers.mjs, register-ts.mjs
+                             fixtures and the .js->.ts import hook for plain node
+  tests/isolation/config.test.mjs, content-path.test.mjs, guard.test.mjs, graph-worker.test.mjs
+                             Integration's dependency-free node --test suites
+  tests/isolation/verify-guards.test.mjs, verify-guards-round3.test.mjs, verify-independent.test.mjs
+                             written by Verification (independent checks; not edited by Integration,
+                             except one fs.allow expectation in verify-independent.test.mjs)
+
+Modified files
+  server/index.ts            resolver at startup (exit 2 on failure), 127.0.0.1 bind, guards, no YAML/home,
+                             no watcher, mutation routes 403, semantic disabled, GET /api/graph/refresh,
+                             GET /api/agents (project mode), safe /api/note and /api/config/validate
+  server/graph-worker.ts     project-mode walk/read through content-path policy (no symlink following)
+  server/embeddings.ts       disabled in project mode (no transformers import, no cache file I/O)
+  vite.config.ts             project-mode server/preview options, guard plugin, HTML transform, define flag
+  src/vite-env.d.ts          declares __JARVIS_PROJECT_MODE__
+  src/App.tsx, src/hooks/useVaultGraph.ts, src/components/SearchBar.tsx
+                             no semantic polling/requests in project mode; App.tsx also mounts AgentsPanel
+  src/components/Sidebar.tsx editor tab removed, remote images blocked, external links inert
+  src/components/NoteEditor.tsx read-only, save is a no-op
+  src/components/Settings.tsx community shapes hidden, "Refresh Graph" replaces "Change Vault"
+  src/shapes/casberry.ts, src/shapes/registry.ts
+                             community/Firestore access blocked in project mode
+
+Vite `fs.allow` is the app dir only (not the vault); the dev-server guard
+(`isForbiddenDevFsRequest` in server/request-guard.ts, wired in vite.config.ts) returns 403 for any
+`/@fs/` request outside the app dir or under the vault, in encoded/backslash/case variants.
+`/api/graph/refresh` additionally requires an allowed-or-absent Origin, `Sec-Fetch-Site`
+same-origin/none (if present) and header `X-Jarvis-Refresh: 1` (sent by the Settings button).
+
+Vite's HMR WebSocket additionally gets an Origin allow-list (upgrade listener in
+vite.config.ts); Vite 5.4.21 itself enforces Host (allowedHosts) and the ws token.
+server/graph-worker.ts loads content-path.ts by explicit file URL (tsx does not remap
+relative specifiers inside worker threads) and vite.config.ts excludes tests/** from vitest.
+
+The dev-request guard also rejects, for all URLs, any '.'/'..' segment after repeated
+percent-decoding and backslash folding, any URL mentioning the vault directory name, and
+dotfile segments (except node_modules/.vite).
+
+Install and verification (2026-11-07)
+  Install:  `npm ci --ignore-scripts` in vendor/jarvis (595 packages, Vite 5.4.21, vitest 4.0.18);
+            package.json and package-lock.json hashes unchanged; npm audit not run (45 advisories reported, untriaged).
+  Tests:    node --test "tests/isolation/*.test.mjs": 48 tests, 47 pass, 0 fail, 1 skipped
+            (file-symlink test; no privilege). vitest run (project-mode env): 26 upstream tests pass.
+  tsc:      tsconfig.node.json 5 errors, tsconfig.app.json 4 errors, all in unmodified upstream lines.
+              Always run tsc with --noEmit (stray .js build output from an earlier run was removed).  Runtime:  supervised launch on ports 3102/5273 (3002/5173 were held by an unrelated pre-existing Jarvis
+            copy, untouched). Passed: loopback bind, Host/Origin, mutation 403, /@fs and traversal
+            blocking, HMR token/Origin guard, graph = 7 notes and 16 unique links (22 wikilink
+            occurrences; upstream dedupes undirected pairs).
+  Start:    from vendor/jarvis with JARVIS_PROJECT_MODE=1, JARVIS_PROJECT_VAULT=<demo-vault>, optional
+            JARVIS_PROJECT_API_PORT / JARVIS_PROJECT_UI_PORT: `npx tsx server/index.ts` and `npx vite`.
+
+Remaining limitations
+  - Browser rendering, CSP and browser-side external requests unverified.
+  - File/directory symlink and file-swap race tests not run (no privilege); a junction case ran.
+  - A WebSocket with no Origin header is accepted by design (Host and token still required).
+  - The process is not sandboxed; the check-then-use race is narrowed, not eliminated; hardlinks undetected.
+  - Incident: an unguarded `vitest run` during setup loaded the upstream branch of vite.config.ts and read the
+    real ~/.jarvis-config.yaml (contents not printed or used). Rule: always run vite/vitest/tsx with the
+    project-mode env.
+
+  - Dev guard also denies non-source runtime artifacts anywhere in a dev URL (per path segment, case-insensitive,
+    after repeated decoding): *.log *.err *.out *.tsbuildinfo *.pid *.bak *.orig *.swp *.tmp *.env *.pem *.key,
+    optimization-log.json, MODIFICATIONS[.ext], .env*; plus NTFS ADS (name:stream, except after /@id/),
+    trailing dot/space segments. server/request-guard.ts DEV_DENY_SEGMENT_PATTERNS.
+  - Launcher logs go to <project>\.local\run\ (gitignored, outside appDir), not vendor\jarvis.
+  - Kanban caps: title 160, evidence 600, deliverable/blocker/next action 300 (was 120/200); 64 KB record cap and
+    25 tasks per column unchanged.
+
+Not modified: LICENSE, package.json, package-lock.json, index.html (the Google
+Fonts links are stripped at serve time by a Vite transform in project mode),
+src/workers/force3d.worker.ts (wasm URL is local; community resolution is
+blocked via registry.ts), scripts/ and playwright tests (must not be run).
+
+- Mission view visual pass 2 (AgentsPanel.tsx, KanbanPanel.tsx only): static glass/glow panels, small-caps headings, per-column coloured header strips, ring-style CSS initials avatars, recorded-counts strip computed from /api/agents, hover glow and narrow-width wrap via one inline <style>. No new data, endpoints, polling or live indicators.
+
+- 2026-11-07: Removed screenshots/ (whole folder) and demo/timelapse.mp4 to slim the vendored copy; README image links to screenshots/ removed or replaced with '(screenshot omitted)'.
+
+- 2026-11-07 Dynamic roster (server/agents-roster.ts, src/components/AgentsPanel.tsx, tests/isolation/{dynamic-roster,agents-roster,kanban}.test.mjs): the five hard-coded agent names are removed. Members come from the .squad/team.md "Members" table, cross-checked with .squad/casting/registry.json (retired excluded). Ids are strict lowercase slugs (^[a-z0-9][a-z0-9-]{0,39}$, ASCII pre-check, reserved Windows names rejected, max 20 members, skipped names counted not echoed). Allow-list = 3 fixed files + per-member .squad/agents/<id>/charter.md and docs/status/<id>.md built from validated ids; readAllowedRecord now takes the allow-list explicitly. Empty/unparseable roster => no agents plus a "No roster found" rosterReason. Response adds rosterSource, rosterReason, skippedCount. Panel shows the reason and skipped count. Existing 64 KB cap, containment checks, sanitiser and state rules unchanged.
+
+- 2026-11-07 Roster hardening (Security review): /api/agents wraps buildRoster in try/catch (fixed 500 {error:'roster unavailable'}); readAllowedRecord rejects nlink > 1; member id 'readme' reserved; names validated on the raw cell (only a balanced outer **/backtick wrapper unwrapped) so 'a_b' is rejected; tests added in tests/isolation/dynamic-roster.test.mjs.
+
+- 2026-11-07 Optional usage panel (server/usage-summary.ts, GET /api/usage in server/index.ts, src/components/UsagePanel.tsx + App.tsx mount, tests/isolation/usage-summary.test.mjs; collector scripts/usage-summary.mjs at repo root): OFF by default; enabled only by .local/usage-panel.json {"enabled": true}. Reads two more fixed files (.local/usage-panel.json, .local/usage-summary.json) via readAllowedRecord, strict whitelist validation, no GitHub data, no network, mutations stay 403.

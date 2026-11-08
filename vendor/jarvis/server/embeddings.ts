@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2025 Prompt-Surfer (https://github.com/Prompt-Surfer)
+//
+// MODIFIED 2026-11-07 for Connected AI Brain Lab project-only isolation
+// (see MODIFICATIONS): in project mode (JARVIS_PROJECT_MODE=1) embeddings are
+// disabled — no ~/.jarvis-embeddings.json access, no model download, and
+// @xenova/transformers is never imported. Upstream behaviour is otherwise unchanged.
+
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { projectModeRequested } from './config.js'
+
+// ─── Types ─────────────────────────────────────────────────────────────────────
+
+interface EmbeddingEntry {
+  mtime: string
+  embedding: number[]
+}
+
+interface EmbeddingCache {
+  version: number
+  model: string
+  entries: Record<string, EmbeddingEntry>
+}
+
+export interface SemanticResult {
+  id: string
+  label: string
+  score: number
+  excerpt: string
+}
+
+export interface SemanticStatus {
+  ready: boolean
+  indexed: number
+  total: number
+  model: string
+  disabled?: boolean
+}
+
+// ─── State ─────────────────────────────────────────────────────────────────────
+
+const MODEL_NAME = 'Xenova/all-MiniLM-L6-v2'
+
+/** Evaluated on every call so no embedding side effect can happen in project mode. */
+function embeddingsDisabled(): boolean {
+  return projectModeRequested()
+}
+
+// Resolved lazily: project mode must never even compute a home-directory path.
+function cachePath(): string {
+  return path.join(os.homedir(), '.jarvis-embeddings.json')
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let pipeline: any = null
+let cache: EmbeddingCache = { version: 1, model: MODEL_NAME, entries: {} }
+let indexReady = false
+let indexedCount = 0
+let totalCount = 0
+
+// If the transformers/sharp pipeline can't load (e.g. missing native binary for
+// this arch), remember it so we fail fast ONCE instead of re-throwing per note.
+// Without this, a broken `sharp` install made buildEmbeddingIndex log a full
+// stack trace for every note in the vault (~58/sec, 400k+ log lines) and cache
+// zero embeddings — flooding logs and threatening the disk.
+let pipelineFailed = false
+
+// Cap noisy per-note embed-failure logging within a single build.
+const MAX_EMBED_ERROR_LOGS = 10
+let embedFailures = 0
+
+// ─── Pipeline ──────────────────────────────────────────────────────────────────
+
+async function ensurePipeline(): Promise<void> {
+  if (embeddingsDisabled()) throw new Error('embeddings are disabled in project mode')
+  if (pipeline) return
+  if (pipelineFailed) throw new Error('embedding pipeline unavailable (load failed earlier)')
+  try {
+    const { pipeline: createPipeline } = await import('@xenova/transformers')
+    pipeline = await createPipeline('feature-extraction', MODEL_NAME)
+  } catch (err) {
+    pipelineFailed = true
+    throw err
+  }
+}
+
+async function getEmbedding(text: string): Promise<number[]> {
+  await ensurePipeline()
+  const output = await pipeline(text, { pooling: 'mean', normalize: true })
+  return Array.from(output.data as Float32Array)
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, normA = 0, normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+// ─── Cache I/O ─────────────────────────────────────────────────────────────────
+
+function loadCache(): void {
+  if (embeddingsDisabled()) return
+  try {
+    const raw = fs.readFileSync(cachePath(), 'utf-8')
+    const parsed = JSON.parse(raw) as EmbeddingCache
+    if (parsed.version === 1 && parsed.model === MODEL_NAME) {
+      cache = parsed
+    }
+  } catch {
+    // No cache or invalid — start fresh
+  }
+}
+
+function saveCache(): void {
+  if (embeddingsDisabled()) return
+  try {
+    fs.writeFileSync(cachePath(), JSON.stringify(cache), 'utf-8')
+  } catch (err) {
+    console.error('[embeddings] Failed to write cache:', err)
+  }
+}
+
+// ─── Index Building ────────────────────────────────────────────────────────────
+
+interface NoteInput {
+  id: string
+  label: string
+  content: string
+  excerpt: string
+  mtime: string
+}
+
+// Yield to event loop so Express can serve status polls during long embedding builds
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
+export async function buildEmbeddingIndex(notes: NoteInput[]): Promise<void> {
+  if (embeddingsDisabled()) return
+  loadCache()
+  totalCount = notes.length
+  indexedCount = 0
+  indexReady = false
+  pipelineFailed = false // retry the model each build (e.g. after a deps fix)
+  embedFailures = 0
+
+  console.log(`[embeddings] Building index for ${notes.length} notes...`)
+
+  // Load the model ONCE up front. If it can't load (e.g. missing native
+  // dependency), warn a single time and skip embeddings entirely rather than
+  // failing — and logging a stack trace — once per note across the whole vault.
+  try {
+    await ensurePipeline()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split('\n')[0] : String(err)
+    console.warn(`[embeddings] Model unavailable — semantic search disabled for this build: ${msg}`)
+    return
+  }
+
+  for (const note of notes) {
+    indexedCount++
+
+    // Skip if cache hit and mtime unchanged
+    const cached = cache.entries[note.id]
+    if (cached && cached.mtime === note.mtime) {
+      // Yield every 200 cache hits so status polls can be served
+      if (indexedCount % 200 === 0) await yieldToEventLoop()
+      continue
+    }
+
+    // Build embedding text: title repeated for weight + first 500 chars of content
+    const snippet = note.content.slice(0, 500)
+    const text = `${note.label} ${note.label}\n${snippet}`
+
+    try {
+      const embedding = await getEmbedding(text)
+      cache.entries[note.id] = { mtime: note.mtime, embedding }
+    } catch (err) {
+      // Guard against runaway per-note spam: log the first few, then a summary.
+      embedFailures++
+      if (embedFailures <= MAX_EMBED_ERROR_LOGS) {
+        const msg = err instanceof Error ? err.message.split('\n')[0] : String(err)
+        console.error(`[embeddings] Failed to embed "${note.id}": ${msg}`)
+        if (embedFailures === MAX_EMBED_ERROR_LOGS) {
+          console.error('[embeddings] Further per-note embed failures suppressed for this build.')
+        }
+      }
+    }
+
+    // Periodic save + yield to event loop every 50 notes
+    if (indexedCount % 50 === 0) {
+      saveCache()
+      console.log(`[embeddings] Progress: ${indexedCount}/${totalCount}`)
+      await yieldToEventLoop()
+    }
+  }
+
+  // Remove stale entries
+  const noteIds = new Set(notes.map(n => n.id))
+  for (const id of Object.keys(cache.entries)) {
+    if (!noteIds.has(id)) delete cache.entries[id]
+  }
+
+  saveCache()
+  indexReady = true
+  console.log(`[embeddings] Index ready: ${Object.keys(cache.entries).length} embeddings cached`)
+}
+
+// ─── Search ────────────────────────────────────────────────────────────────────
+
+export async function semanticSearch(query: string, notes: NoteInput[], limit = 10): Promise<{ results: SemanticResult[]; ready: boolean; disabled?: boolean }> {
+  if (embeddingsDisabled()) return { results: [], ready: false, disabled: true }
+  if (!indexReady) {
+    return { results: [], ready: false }
+  }
+
+  const queryEmbedding = await getEmbedding(query)
+
+  const scored: { id: string; score: number }[] = []
+  for (const [id, entry] of Object.entries(cache.entries)) {
+    const score = cosineSimilarity(queryEmbedding, entry.embedding)
+    scored.push({ id, score })
+  }
+
+  scored.sort((a, b) => b.score - a.score)
+
+  const noteMap = new Map(notes.map(n => [n.id, n]))
+  const results: SemanticResult[] = scored.slice(0, limit).map(s => {
+    const note = noteMap.get(s.id)
+    return {
+      id: s.id,
+      label: note?.label ?? s.id,
+      score: Math.round(s.score * 100) / 100,
+      excerpt: note?.excerpt ?? '',
+    }
+  })
+
+  return { results, ready: true }
+}
+
+export function getSemanticStatus(): SemanticStatus {
+  if (embeddingsDisabled()) {
+    return { ready: false, indexed: 0, total: 0, model: 'disabled', disabled: true }
+  }
+  return {
+    ready: indexReady,
+    indexed: indexedCount,
+    total: totalCount,
+    model: MODEL_NAME,
+  }
+}
+
+export function resetEmbeddingIndex(): void {
+  indexReady = false
+  indexedCount = 0
+  totalCount = 0
+}

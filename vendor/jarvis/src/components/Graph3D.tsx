@@ -1,0 +1,2111 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2025 Prompt-Surfer (https://github.com/Prompt-Surfer)
+
+import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle, useState } from 'react'
+import * as THREE from 'three'
+import { TrackballControls } from 'three/addons/controls/TrackballControls.js'
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js'
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js'
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
+import type { GraphNode, GraphData } from '../hooks/useVaultGraph'
+import type { NodePosition, TagBox, TreeBranch, TreeLabel, PerfMetrics, LiveSimPositions } from '../hooks/useForce3D'
+import type { GraphShape } from '../shapes/types'
+import { getNodeColor } from '../lib/colors'
+
+// Auto-rotate: quarter of casberry's default speed (autoRotateSpeed 1.0 → 120s/orbit @60fps)
+const AUTO_ROTATE_AXIS = new THREE.Vector3(0, 1, 0)
+const AUTO_ROTATE_ANGLE = (2 * Math.PI) / (60 * 60 * 2)
+const autoRotOffset = new THREE.Vector3()
+
+interface Graph3DProps {
+  graphData: GraphData
+  positions: Map<string, NodePosition>
+  /** Live binary position channel (P1/P2) — consumed by the RAF loop, bypasses React */
+  livePositions?: React.RefObject<LiveSimPositions>
+  selectedNodeId: string | null
+  hoveredNodeId: string | null
+  searchResults: string[] | null
+  timeFilterIds: Set<string> | null
+  tagIsolationIds: Set<string> | null
+  focusModeNodeIds: Set<string> | null
+  collapsedNodes: Set<string>
+  visibleNodes: Set<string>
+  nodeOpacity: number
+  bloomStrength: number
+  spread?: number
+  starsEnabled: boolean
+  labelsEnabled: boolean
+  nodeDegrees: Map<string, number>
+  minNodeSize: number
+  maxNodeSize: number
+  ultraNodeSize: number
+  onNodeClick: (node: GraphNode) => void
+  onNodeDoubleClick: (node: GraphNode) => void
+  onNodeHover: (node: GraphNode | null, x: number, y: number) => void
+  onNodeRightClick: (node: GraphNode) => void
+  onFlyTo: (nodeId: string) => void
+  flashNodeId?: string | null
+  onPinNodes?: (pinned: Array<{ id: string; x: number; y: number; z: number }>) => void
+  onMoveNodes?: (pinned: Array<{ id: string; x: number; y: number; z: number }>) => void
+  onUnpinNodes?: (ids: string[]) => void
+  electronScene?: THREE.Scene
+  graphShape?: GraphShape
+  autoRotate?: boolean
+  tagBoxes?: TagBox[]
+  treeBranches?: TreeBranch[]
+  treeLabels?: TreeLabel[]
+  linksEnabled?: boolean
+  timeFilterActive?: boolean
+  textSize?: number
+  perfRef?: React.RefObject<PerfMetrics>
+}
+
+export interface Graph3DHandle {
+  flyTo: (nodeId: string) => void
+  resetCamera: () => void
+  reheat: () => void
+  getScene: () => THREE.Scene | null
+  getCamera: () => THREE.PerspectiveCamera | null
+  getCameraPosition: () => THREE.Vector3
+  getCameraTarget: () => THREE.Vector3
+  panCameraTo: (x: number, z: number) => void
+}
+
+const NODE_RADIUS = 4
+// Trees shape: fixed camera elevation above the ground plane (turntable orbit)
+const TREES_ELEV_RAD = 12 * Math.PI / 180
+const NODE_SEGMENTS = 8
+
+// Enable render-loop profiling via ?perf query param in dev
+const DEBUG = import.meta.env.DEV && typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).has('perf')
+
+function createSelectedTitleSprite(text: string): THREE.Sprite {
+  const W = 512, H = 64
+  const canvas = document.createElement('canvas')
+  canvas.width = W
+  canvas.height = H
+  const ctx = canvas.getContext('2d')!
+  const label = text.length > 32 ? text.slice(0, 30) + '…' : text
+  ctx.font = 'bold 16px "Inter", "Segoe UI", sans-serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillStyle = '#00ccff'
+  ctx.globalAlpha = 0.95
+  ctx.fillText(label, W / 2, H / 2)
+  const texture = new THREE.CanvasTexture(canvas)
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
+  const sprite = new THREE.Sprite(mat)
+  sprite.scale.set(80, 12, 1)
+  return sprite
+}
+
+function createLabelSprite(text: string): THREE.Sprite {
+  const W = 256, H = 48
+  const canvas = document.createElement('canvas')
+  canvas.width = W
+  canvas.height = H
+  const ctx = canvas.getContext('2d')!
+  const label = text.length > 22 ? text.slice(0, 20) + '…' : text
+  ctx.font = '14px "Inter", "Segoe UI", sans-serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillStyle = '#00a8cc'
+  ctx.globalAlpha = 0.8
+  ctx.fillText(label, W / 2, H / 2)
+  const texture = new THREE.CanvasTexture(canvas)
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
+  const sprite = new THREE.Sprite(mat)
+  sprite.scale.set(40, 7.5, 1)
+  return sprite
+}
+
+function createTagBoxLabelSprite(tag: string, count: number): THREE.Sprite {
+  // Canvas resolution is 4× the world-unit scale for crisp text at zoom-out
+  const W = 720, H = 144
+  const canvas = document.createElement('canvas')
+  canvas.width = W
+  canvas.height = H
+  const ctx = canvas.getContext('2d')!
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 36px "Inter", "Segoe UI", sans-serif'
+  ctx.fillStyle = '#ffffff'
+  ctx.fillText(tag, W / 2, H / 2 - 20)
+  ctx.font = '26px "Inter", "Segoe UI", sans-serif'
+  ctx.fillStyle = '#aaaaaa'
+  ctx.fillText(`${count} notes`, W / 2, H / 2 + 30)
+  const texture = new THREE.CanvasTexture(canvas)
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
+  const sprite = new THREE.Sprite(mat)
+  // Scale to match box width (TAG_BOX_HALF=180 → box width=360); height proportional
+  sprite.scale.set(720, 144, 1)
+  return sprite
+}
+
+export const Graph3D = forwardRef<Graph3DHandle, Graph3DProps>(({
+  graphData,
+  positions,
+  livePositions,
+  selectedNodeId,
+  hoveredNodeId,
+  searchResults,
+  timeFilterIds,
+  tagIsolationIds,
+  focusModeNodeIds,
+  visibleNodes,
+  nodeOpacity,
+  bloomStrength,
+  starsEnabled,
+  labelsEnabled,
+  nodeDegrees,
+  minNodeSize,
+  maxNodeSize,
+  ultraNodeSize,
+  onNodeClick,
+  onNodeDoubleClick,
+  onNodeHover,
+  onNodeRightClick: _onNodeRightClick,
+  flashNodeId,
+  onPinNodes,
+  onMoveNodes,
+  onUnpinNodes,
+  graphShape,
+  autoRotate = false,
+  tagBoxes,
+  treeBranches,
+  treeLabels,
+  linksEnabled = true,
+  timeFilterActive = false,
+  textSize = 1.0,
+  spread = 4.0,
+  perfRef: simPerfRef,
+}, ref) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const autoRotateRef = useRef(autoRotate)
+  const userInteractingRef = useRef(false)
+  useEffect(() => { autoRotateRef.current = autoRotate }, [autoRotate])
+  // Starfield sizes off spread (the intended zoom control), NOT the live
+  // bounding sphere — so MIN DISTANCE re-spacing never moves the stars.
+  const spreadRef = useRef(spread)
+  useEffect(() => { spreadRef.current = spread }, [spread])
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
+  const sceneRef = useRef<THREE.Scene | null>(null)
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
+  const controlsRef = useRef<TrackballControls | null>(null)
+  const composerRef = useRef<EffectComposer | null>(null)
+  const bloomPassRef = useRef<UnrealBloomPass | null>(null)
+  const instancedMeshRef = useRef<THREE.InstancedMesh | null>(null)
+  const lineSegmentsRef = useRef<THREE.LineSegments | null>(null)
+  const selectedEdgeLinesRef = useRef<THREE.LineSegments | null>(null)
+  const tagBoxMeshesRef = useRef<THREE.LineSegments[]>([])
+  const tagBoxSpritesRef = useRef<THREE.Sprite[]>([])
+  const nodeIndexMapRef = useRef<Map<string, number>>(new Map())
+  const starsRef = useRef<THREE.Points | null>(null)
+  const galaxySpritesRef = useRef<THREE.Sprite[]>([])
+  const labelsMapRef = useRef<Map<string, THREE.Sprite>>(new Map())
+  const annotLineRef = useRef<THREE.Line | null>(null)
+  const frameRef = useRef<number>(0)
+  const lastClickTimeRef = useRef<number>(0)
+  const lastClickNodeRef = useRef<string | null>(null)
+  const projRef = useRef(new THREE.Vector3())
+  const proximityNodeRef = useRef<GraphNode | null>(null)
+  const mouseDownPosRef = useRef({ x: 0, y: 0 })
+  const rightDragRef = useRef<{
+    active: boolean
+    nodeIds: string[]
+    nodeStartPositions: Map<string, { x: number; y: number; z: number }>
+    overridePositions: Map<string, { x: number; y: number; z: number }>
+    lastScreenX: number
+    lastScreenY: number
+  } | null>(null)
+  // P3: drag→sim sync coalesced to one moveNodes message per frame
+  const pendingMoveRef = useRef<Array<{ id: string; x: number; y: number; z: number }> | null>(null)
+  const moveRafRef = useRef<number | null>(null)
+  const lastMaxDistUpdateRef = useRef(0)
+  const lastMaxDistRafRef = useRef(0) // RAF-loop throttle for spread-aware maxDistance
+  const selectedBracketRef = useRef<THREE.LineSegments | null>(null)
+  const selectedTitleSpriteRef = useRef<THREE.Sprite | null>(null)
+  const [sceneReady, setSceneReady] = useState(false)
+
+  // Performance HUD state (only active with ?perf flag)
+  const perfHudRef = useRef<HTMLDivElement | null>(null)
+  const renderFpsTimesRef = useRef<number[]>([])
+  const renderMsSamplesRef = useRef<number[]>([])
+  const bloomCostSamplesRef = useRef<number[]>([])
+  // Stutter tracking: rAF-to-rAF intervals (catches main-thread jank even when render is gated)
+  const rafIntervalsRef = useRef<number[]>([])
+  const lastRafTsRef = useRef(0)
+
+  // PERF: dirty-flag render gate — only call renderer.render() when scene has changed
+  const isDirtyRef = useRef(true)
+  // Live graphShape for the RAF loop (the loop effect doesn't re-run per shape)
+  const graphShapeRef = useRef(graphShape)
+  graphShapeRef.current = graphShape
+
+  // Position interpolation (lerp) — decouple render rate from sim rate for smooth 60fps motion.
+  // P1/P2: lerp targets come from livePositions (typed array, index-aligned to
+  // graphData.nodes). Displayed positions live in two views over the SAME objects:
+  // displayedObjsRef (index-based, hot path) and displayedPositionsRef (id-keyed, for
+  // raycasting/proximity/labels/drag) — mutating one updates both.
+  const displayedPositionsRef = useRef(new Map<string, { x: number; y: number; z: number }>())
+  const displayedObjsRef = useRef<Array<{ x: number; y: number; z: number }>>([])
+  const lastLiveVersionRef = useRef(0)
+  // Link endpoint node indices (2 per link) + per-node link index lists — lets the RAF
+  // loop and drag updates use index math instead of per-link id lookups
+  const linkIndexPairsRef = useRef<Int32Array | null>(null)
+  const linksByNodeRef = useRef<Map<string, number[]>>(new Map())
+  // Visibility flags aligned to graphData.nodes — written by Effect 1, read by RAF loop
+  const visibleFlagsRef = useRef<Uint8Array | null>(null)
+  const isLerpingRef = useRef(false)
+  const simPositionsRef = useRef<Map<string, NodePosition>>(new Map()) // latest sim data (for tier lookup)
+  const hasAppliedMatricesRef = useRef(false) // track initial matrix application
+
+  // Change-detection refs: skip expensive Three.js matrix+link updates when positions unchanged
+  const lastPositionsRef = useRef<Map<string, NodePosition> | null>(null)
+  const lastVisibleNodesRef = useRef<Set<string> | null>(null)
+  const lastSizeParamsRef = useRef({ minNodeSize: -1, maxNodeSize: -1, ultraNodeSize: -1 })
+  const lastFiltersRef = useRef({
+    timeFilterIds: null as Set<string> | null,
+    tagIsolationIds: null as Set<string> | null,
+    focusModeNodeIds: null as Set<string> | null,
+  })
+
+  // Entrance animation tracking: nodeId → animation startTime (ms)
+  const entranceAnimsRef = useRef<Map<string, number>>(new Map())
+  // Set of currently-visible nodeIds for new-node detection
+  const visibleForAnimRef = useRef<Set<string>>(new Set())
+  // Latest props needed by the RAF animation loop (avoids stale closures)
+  const liveNodeSizeRef = useRef({ minNodeSize, maxNodeSize, ultraNodeSize })
+  const textSizeRef = useRef(textSize)
+  const graphDataRef = useRef<GraphData | null>(null)
+  const timeFilterActiveRef = useRef(timeFilterActive)
+  const selectedNodeIdRef = useRef(selectedNodeId)
+  // Set of currently-visible node IDs for RAF lerp loop (avoids making hidden nodes visible)
+  const liveVisibleSetRef = useRef<Set<string>>(new Set())
+
+  // Keep animation-support refs in sync with props
+  useEffect(() => { liveNodeSizeRef.current = { minNodeSize, maxNodeSize, ultraNodeSize } }, [minNodeSize, maxNodeSize, ultraNodeSize])
+  useEffect(() => {
+    textSizeRef.current = textSize
+    // Rescale all existing label sprites to reflect new text size
+    for (const sprite of labelsMapRef.current.values()) {
+      sprite.scale.set(40 * textSize, 7.5 * textSize, 1)
+    }
+    // Tree/folder topic labels are separate sprites with a larger base scale —
+    // rescale them too so the TEXT SIZE slider applies to folder names in trees.
+    for (const sprite of treeLabelSpritesRef.current) {
+      sprite.scale.set(110 * textSize, 20.6 * textSize, 1)
+    }
+    isDirtyRef.current = true
+  }, [textSize])
+  useEffect(() => {
+    graphDataRef.current = graphData
+    // Reset lerp state on graph DATA change — displayed objects are rebuilt from the
+    // live stream on the next RAF. Shape-only changes keep the same graphData object,
+    // so displayed positions persist and the lerp morphs smoothly between shapes.
+    displayedPositionsRef.current.clear()
+    displayedObjsRef.current = []
+    isLerpingRef.current = false
+    hasAppliedMatricesRef.current = false
+  }, [graphData])
+  useEffect(() => { timeFilterActiveRef.current = timeFilterActive }, [timeFilterActive])
+  useEffect(() => { selectedNodeIdRef.current = selectedNodeId }, [selectedNodeId])
+
+  // Throttled React mirror of sim positions — used for tier lookups and one-shot
+  // effects. The 60fps hot path reads livePositions directly in the RAF loop.
+  useEffect(() => {
+    if (positions.size === 0) return
+    simPositionsRef.current = positions
+    isDirtyRef.current = true
+  }, [positions])
+
+  // Build scene once
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    // Reset sceneReady on re-mount (HMR, strict mode) so RAF loop re-triggers
+    setSceneReady(false)
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
+    // Detect WebGL context loss — primary cause of unexplained black screens
+    canvas.addEventListener('webglcontextlost', (e) => {
+      console.error('[Graph3D] WebGL context LOST', e)
+      e.preventDefault() // allow context restore
+    })
+    canvas.addEventListener('webglcontextrestored', () => {
+      console.warn('[Graph3D] WebGL context restored — forcing re-render')
+      isDirtyRef.current = true
+    })
+    // Cap at 2× — 3× pixel ratio on high-DPI triples GPU load and caps effective FPS.
+    // RAF loop — uncapped, targets display refresh rate (60Hz/120Hz/144Hz).
+    // No manual throttling. setPixelRatio cap only affects resolution, not frame rate.
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight)
+    renderer.setClearColor(0x000000, 1)
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.2
+    rendererRef.current = renderer
+
+    const scene = new THREE.Scene()
+    sceneRef.current = scene
+
+    const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight, 0.1, 200000)
+    camera.position.set(0, 0, 600)
+    cameraRef.current = camera
+
+    // TrackballControls (not OrbitControls): free 360° tumbling around the target
+    // (centre of gravity) with no fixed up-vector, so vertical rotation never stops
+    // at the poles. Damped, left-drag rotates, middle dollies, right is disabled
+    // (reserved for node dragging via mouse events).
+    const controls = new TrackballControls(camera, canvas)
+    controls.rotateSpeed = 1.5
+    controls.zoomSpeed = 1.2
+    controls.noPan = true              // panning off (matches prior behaviour)
+    controls.noZoom = true             // built-in wheel zoom off — replaced by zoom-to-cursor below
+    controls.staticMoving = false      // damped (inertial) rotation
+    controls.dynamicDampingFactor = 0.15
+    controls.minDistance = NODE_RADIUS
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: -1 as unknown as THREE.MOUSE, // unmapped → ignored, frees right-click for node drag
+    }
+    // Auto-rotate pauses while the user is dragging
+    controls.addEventListener('start', () => { userInteractingRef.current = true })
+    controls.addEventListener('end', () => { userInteractingRef.current = false })
+    controlsRef.current = controls
+
+    // Bloom post-processing — half-res bloom for 4× cheaper blur passes
+    const composer = new EffectComposer(renderer)
+    const renderPass = new RenderPass(scene, camera)
+    composer.addPass(renderPass)
+
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(Math.ceil(canvas.clientWidth / 2), Math.ceil(canvas.clientHeight / 2)),
+      1.5, 0.4, 0.2
+    )
+    // Reduce mip levels from 5 (default) to 3 — fewer blur iterations, still visually smooth
+    bloomPass.nMips = 3
+    composer.addPass(bloomPass)
+    composerRef.current = composer
+    bloomPassRef.current = bloomPass
+
+    // Signal that scene infrastructure is ready — triggers RAF loop effect
+    setSceneReady(true)
+
+    // Stars — spherical distribution surrounding the scene from all directions.
+    // Three brightness tiers for natural variation (dim 30%, medium 60%, bright 10%).
+    const starGroup = new THREE.Group()
+    starGroup.renderOrder = -1
+
+    const makeStarSphere = (count: number, size: number, opacity: number) => {
+      const geo = new THREE.BufferGeometry()
+      const pos = new Float32Array(count * 3)
+      for (let i = 0; i < count; i++) {
+        const radius = 5000 + Math.random() * 3000
+        const theta = Math.random() * Math.PI * 2
+        const phi = Math.acos(2 * Math.random() - 1)
+        pos[i * 3]     = radius * Math.sin(phi) * Math.cos(theta)
+        pos[i * 3 + 1] = radius * Math.sin(phi) * Math.sin(theta)
+        pos[i * 3 + 2] = radius * Math.cos(phi)
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+      // Screen-space sizing (no distance attenuation) so stars stay visible as a
+      // crisp backdrop however far the shell is scaled out (it tracks the graph
+      // radius, which grows up to ~10× at max spread).
+      const mat = new THREE.PointsMaterial({
+        color: 0xffffff, size, sizeAttenuation: false,
+        transparent: true, opacity, depthWrite: false,
+      })
+      return new THREE.Points(geo, mat)
+    }
+
+    starGroup.add(makeStarSphere(2400, 1.2, 0.35))  // dim stars (screen px)
+    starGroup.add(makeStarSphere(4800, 1.8, 0.6))   // medium stars
+    starGroup.add(makeStarSphere(800, 3.0, 0.95))   // bright stars
+
+    starGroup.visible = false
+    scene.add(starGroup)
+    starsRef.current = starGroup as unknown as THREE.Points
+
+    // Galaxy stars — 14 large bright points distributed on a sphere.
+    const galCount = 14
+    const galGeo = new THREE.BufferGeometry()
+    const galPos = new Float32Array(galCount * 3)
+    for (let i = 0; i < galCount; i++) {
+      const radius = 5500 + Math.random() * 2000
+      const theta = Math.random() * Math.PI * 2
+      const phi = Math.acos(2 * Math.random() - 1)
+      galPos[i * 3]     = radius * Math.sin(phi) * Math.cos(theta)
+      galPos[i * 3 + 1] = radius * Math.sin(phi) * Math.sin(theta)
+      galPos[i * 3 + 2] = radius * Math.cos(phi)
+    }
+    galGeo.setAttribute('position', new THREE.BufferAttribute(galPos, 3))
+    const galMat = new THREE.PointsMaterial({
+      color: 0xffffff, size: 6, sizeAttenuation: true,
+      transparent: true, opacity: 0.95, depthWrite: false,
+    })
+    const galaxyPoints = new THREE.Points(galGeo, galMat)
+    galaxyPoints.renderOrder = -1
+    galaxyPoints.visible = false
+    scene.add(galaxyPoints)
+    galaxySpritesRef.current = [galaxyPoints as unknown as THREE.Sprite]
+
+    // Annotation line: cursor → closest proximity node (solid cyan, drawn on top)
+    const annotGeo = new THREE.BufferGeometry()
+    annotGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3))
+    const annotMat = new THREE.LineBasicMaterial({ color: 0x00d4ff, depthTest: false })
+    const annotLine = new THREE.Line(annotGeo, annotMat)
+    annotLine.visible = false
+    annotLine.renderOrder = 999
+    scene.add(annotLine)
+    annotLineRef.current = annotLine
+
+    // Selected node bracket (wireframe cube, thin cyan, low opacity)
+    const bracketGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1))
+    const bracketMat = new THREE.LineBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.4, depthTest: false })
+    const selectedBracket = new THREE.LineSegments(bracketGeo, bracketMat)
+    selectedBracket.visible = false
+    selectedBracket.renderOrder = 997
+    scene.add(selectedBracket)
+    selectedBracketRef.current = selectedBracket
+
+    // Resize handler — bloom stays at half resolution for performance
+    const onResize = () => {
+      const w = window.innerWidth
+      const h = window.innerHeight
+      camera.aspect = w / h
+      camera.updateProjectionMatrix()
+      renderer.setSize(w, h)
+      composer.setSize(w, h)
+      // Re-apply half-res to bloom pass (composer.setSize resets it to full-res)
+      bloomPass.setSize(Math.ceil(w / 2), Math.ceil(h / 2))
+      controlsRef.current?.handleResize() // TrackballControls caches screen size for trackball projection
+      isDirtyRef.current = true
+    }
+    window.addEventListener('resize', onResize)
+
+    // Zoom-to-cursor: TrackballControls' built-in wheel zoom (noZoom above) dollies
+    // toward the target, losing zoom-to-cursor. Reimplement it here — dolly the camera
+    // AND target toward the world point under the cursor so that point stays fixed.
+    const camDir = new THREE.Vector3()
+    const zoomPlane = new THREE.Plane()
+    const pivot = new THREE.Vector3()
+    const zoomRaycaster = new THREE.Raycaster()
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const cam = cameraRef.current
+      const ctrls = controlsRef.current
+      if (!cam || !ctrls) return
+
+      // Cursor → normalized device coords
+      const rect = canvas.getBoundingClientRect()
+      const ndc = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1,
+      )
+
+      // World point under the cursor: intersect the ray with a plane through the
+      // target facing the camera. Fall back to the ray point at target distance.
+      zoomRaycaster.setFromCamera(ndc, cam)
+      cam.getWorldDirection(camDir)
+      zoomPlane.setFromNormalAndCoplanarPoint(camDir, ctrls.target)
+      if (!zoomRaycaster.ray.intersectPlane(zoomPlane, pivot)) {
+        zoomRaycaster.ray.at(cam.position.distanceTo(ctrls.target), pivot)
+      }
+
+      // Zoom factor from wheel delta (deltaY<0 = wheel up = zoom in → factor<1)
+      const factor = Math.pow(0.95, -e.deltaY * 0.01)
+
+      // Dolly camera + target toward the pivot — keeps the cursor point fixed
+      cam.position.sub(pivot).multiplyScalar(factor).add(pivot)
+      ctrls.target.sub(pivot).multiplyScalar(factor).add(pivot)
+
+      // Clamp camera→target distance to the controls' min/max range
+      const dist = cam.position.distanceTo(ctrls.target)
+      const clamped = Math.min(Math.max(dist, ctrls.minDistance), ctrls.maxDistance)
+      if (clamped !== dist && dist > 0) {
+        cam.position.sub(ctrls.target).multiplyScalar(clamped / dist).add(ctrls.target)
+      }
+
+      isDirtyRef.current = true
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+
+    console.debug('[Graph3D] Scene setup complete — sceneReady=true')
+
+    return () => {
+      console.debug('[Graph3D] Scene cleanup — disposing renderer')
+      window.removeEventListener('resize', onResize)
+      canvas.removeEventListener('wheel', onWheel)
+      cancelAnimationFrame(frameRef.current)
+      renderer.dispose()
+    }
+  }, [])
+
+  // Toggle stars and galaxy points visibility
+  useEffect(() => {
+    if (starsRef.current) starsRef.current.visible = starsEnabled
+    for (const gs of galaxySpritesRef.current) gs.visible = starsEnabled
+    isDirtyRef.current = true
+  }, [starsEnabled])
+
+  // Update bloom — disable the pass entirely when off (avoids running expensive blur shaders)
+  useEffect(() => {
+    if (bloomPassRef.current) {
+      bloomPassRef.current.enabled = bloomStrength > 0
+      bloomPassRef.current.strength = bloomStrength
+    }
+    isDirtyRef.current = true
+  }, [bloomStrength])
+
+  // Toggle link line visibility
+  useEffect(() => {
+    if (lineSegmentsRef.current) {
+      lineSegmentsRef.current.visible = linksEnabled
+      isDirtyRef.current = true
+    }
+  }, [linksEnabled])
+
+  // Build instanced mesh when graph data is ready
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene || !graphData) return
+
+    // Remove old meshes
+    if (instancedMeshRef.current) {
+      scene.remove(instancedMeshRef.current)
+      instancedMeshRef.current.dispose()
+    }
+    if (lineSegmentsRef.current) {
+      scene.remove(lineSegmentsRef.current)
+      lineSegmentsRef.current.geometry.dispose()
+    }
+
+    const nodes = graphData.nodes
+    const count = nodes.length
+
+    // Build index map
+    const indexMap = new Map<string, number>()
+    nodes.forEach((n, i) => indexMap.set(n.id, i))
+    nodeIndexMapRef.current = indexMap
+
+    // InstancedMesh for nodes
+    const geo = new THREE.SphereGeometry(NODE_RADIUS, NODE_SEGMENTS, NODE_SEGMENTS)
+    const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: nodeOpacity })
+    const mesh = new THREE.InstancedMesh(geo, mat, count)
+    mesh.frustumCulled = false
+
+    const dummy = new THREE.Object3D()
+    const color = new THREE.Color()
+
+    nodes.forEach((node, i) => {
+      dummy.position.set(0, 0, 0)
+      dummy.updateMatrix()
+      mesh.setMatrixAt(i, dummy.matrix)
+      color.set(getNodeColor(node.type, node.folder))
+      mesh.setColorAt(i, color)
+    })
+
+    mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    scene.add(mesh)
+    instancedMeshRef.current = mesh
+
+    // Precompute link endpoint indices + per-node link lists — used by the RAF lerp
+    // loop and drag updates for index math instead of per-link id lookups
+    const pairs = new Int32Array(graphData.links.length * 2)
+    const byNode = new Map<string, number[]>()
+    graphData.links.forEach((link, i) => {
+      const srcId = typeof link.source === 'string' ? link.source : (link.source as GraphNode).id
+      const dstId = typeof link.target === 'string' ? link.target : (link.target as GraphNode).id
+      pairs[i * 2] = indexMap.get(srcId) ?? -1
+      pairs[i * 2 + 1] = indexMap.get(dstId) ?? -1
+      let sList = byNode.get(srcId)
+      if (!sList) { sList = []; byNode.set(srcId, sList) }
+      sList.push(i)
+      let dList = byNode.get(dstId)
+      if (!dList) { dList = []; byNode.set(dstId, dList) }
+      dList.push(i)
+    })
+    linkIndexPairsRef.current = pairs
+    linksByNodeRef.current = byNode
+
+    // LineSegments for links — original style unchanged
+    const linkPositions = new Float32Array(graphData.links.length * 6)
+    const linkGeo = new THREE.BufferGeometry()
+    linkGeo.setAttribute('position', new THREE.BufferAttribute(linkPositions, 3))
+    const linkMat = new THREE.LineBasicMaterial({ color: 0x1a3a4a, transparent: true, opacity: 0.5 })
+    const lines = new THREE.LineSegments(linkGeo, linkMat)
+    lines.frustumCulled = false
+    // Apply the current toggle at creation — the visibility effect above may have
+    // run before this mesh existed (e.g. links defaulted off in trees mode)
+    lines.visible = linksEnabled
+    scene.add(lines)
+    lineSegmentsRef.current = lines
+
+    // Highlight overlay: bright cyan lines drawn on top of connected edges only
+    if (selectedEdgeLinesRef.current) {
+      scene.remove(selectedEdgeLinesRef.current)
+      selectedEdgeLinesRef.current.geometry.dispose()
+    }
+    const hlPositions = new Float32Array(graphData.links.length * 6)
+    const hlGeo = new THREE.BufferGeometry()
+    hlGeo.setAttribute('position', new THREE.BufferAttribute(hlPositions, 3))
+    hlGeo.setDrawRange(0, 0) // hidden until a node is selected
+    const hlMat = new THREE.LineBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false })
+    const hlLines = new THREE.LineSegments(hlGeo, hlMat)
+    hlLines.frustumCulled = false
+    hlLines.renderOrder = 1
+    scene.add(hlLines)
+    selectedEdgeLinesRef.current = hlLines
+
+  }, [graphData])
+
+  // PERF: lazy label sprites — dispose on graphData change; new sprites created on-demand in the
+  // positions effect only when labelsEnabled is true. Avoids 927 CanvasTextures on startup.
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene || !graphData) return
+
+    for (const sprite of labelsMapRef.current.values()) {
+      scene.remove(sprite)
+      ;(sprite.material as THREE.SpriteMaterial).map?.dispose()
+      sprite.material.dispose()
+    }
+    labelsMapRef.current.clear()
+  }, [graphData])
+
+  // Selected node: 3D wireframe bracket + floating title sprite
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene) return
+
+    const bracket = selectedBracketRef.current
+
+    if (!selectedNodeId || !graphData) {
+      if (bracket) bracket.visible = false
+      return () => { /* no sprite to clean up */ }
+    }
+
+    const node = graphData.nodes.find(n => n.id === selectedNodeId)
+    if (!node) {
+      if (bracket) bracket.visible = false
+      return () => { /* no sprite to clean up */ }
+    }
+
+    // Create floating title sprite
+    const sprite = createSelectedTitleSprite(node.label)
+    sprite.visible = false
+    scene.add(sprite)
+    selectedTitleSpriteRef.current = sprite
+
+    // Size bracket proportional to node size (tier from worker)
+    if (bracket) {
+      const selTier = simPositionsRef.current.get(selectedNodeId)?.tier ?? 'regular'
+      const sizeMult = selTier === 'ultranode' ? ultraNodeSize : selTier === 'supernode' ? maxNodeSize : minNodeSize
+      const bracketSize = NODE_RADIUS * sizeMult * 3
+      bracket.scale.set(bracketSize, bracketSize, bracketSize)
+      bracket.visible = true
+    }
+
+    // Position immediately if position data is available
+    const selPos = displayedPositionsRef.current.get(selectedNodeId)
+    if (selPos) {
+      if (bracket) bracket.position.set(selPos.x, selPos.y, selPos.z)
+      sprite.position.set(selPos.x, selPos.y + NODE_RADIUS * 5.5, selPos.z)
+      sprite.visible = true
+    }
+
+    isDirtyRef.current = true
+    return () => {
+      scene.remove(sprite)
+      ;(sprite.material as THREE.SpriteMaterial).map?.dispose()
+      sprite.material.dispose()
+      selectedTitleSpriteRef.current = null
+      if (bracket) bracket.visible = false
+      isDirtyRef.current = true
+    }
+  }, [selectedNodeId, graphData, nodeDegrees, minNodeSize, maxNodeSize, ultraNodeSize])
+
+  // Tag box wireframes — render/remove white EdgesGeometry boxes + label sprites for tagboxes shape
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene) return
+
+    // Remove old boxes
+    for (const box of tagBoxMeshesRef.current) {
+      scene.remove(box)
+      box.geometry.dispose()
+    }
+    tagBoxMeshesRef.current = []
+
+    // Remove old label sprites
+    for (const sprite of tagBoxSpritesRef.current) {
+      scene.remove(sprite)
+      ;(sprite.material as THREE.SpriteMaterial).map?.dispose()
+      sprite.material.dispose()
+    }
+    tagBoxSpritesRef.current = []
+
+    if (graphShape !== 'tagboxes' || !tagBoxes || tagBoxes.length === 0) return
+
+    for (const box of tagBoxes) {
+      const isVirtual = box.isVirtual ?? false
+      const hx = box.halfSizeX ?? box.halfSize ?? 180
+      const hy = box.halfSizeY ?? box.halfSize ?? 180
+      const hz = box.halfSizeZ ?? box.halfSize ?? 180
+      const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2))
+      const mat = new THREE.LineBasicMaterial({
+        color: isVirtual ? 0x00ffcc : 0xffffff,
+        transparent: true,
+        opacity: isVirtual ? 0.4 : 1.0,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+      })
+      const lines = new THREE.LineSegments(geo, mat)
+      lines.position.set(box.cx, box.cy, box.cz)
+      scene.add(lines)
+      tagBoxMeshesRef.current.push(lines)
+
+      // Label sprite positioned below bottom front edge
+      const sprite = createTagBoxLabelSprite(box.tag, box.count)
+      if (isVirtual) {
+        // Virtual boxes get smaller labels
+        sprite.scale.multiplyScalar(0.8)
+      }
+      sprite.position.set(
+        box.cx,
+        box.cy - hy - 20,
+        box.cz + hz,
+      )
+      scene.add(sprite)
+      tagBoxSpritesRef.current.push(sprite)
+    }
+    isDirtyRef.current = true
+  }, [tagBoxes, graphShape])
+
+  // Trees ground — a solid opaque square plane with grid lines on top, sized
+  // square to the settled layout for a clean viewing platform. Rebuilt on
+  // delayed timers because node positions stream in after the shape switch;
+  // purely cosmetic so late sizing is harmless.
+  const treesGroundRef = useRef<THREE.Group | null>(null)
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene) return
+    const removeGround = () => {
+      const g = treesGroundRef.current
+      if (g) {
+        scene.remove(g)
+        g.traverse(obj => {
+          const mesh = obj as THREE.Mesh
+          if (mesh.geometry) mesh.geometry.dispose()
+          if (mesh.material) (mesh.material as THREE.Material).dispose()
+        })
+        treesGroundRef.current = null
+      }
+    }
+    if (graphShape !== 'trees') { removeGround(); return }
+    const buildGround = () => {
+      let maxE = 0
+      for (const [, p] of displayedPositionsRef.current) {
+        maxE = Math.max(maxE, Math.abs(p.x), Math.abs(p.z))
+      }
+      if (maxE === 0) return
+      removeGround()
+      const size = maxE * 2.6
+      const group = new THREE.Group()
+      // Opaque floor slab just under the grid lines
+      const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(size, size),
+        new THREE.MeshBasicMaterial({ color: 0x0b2338, side: THREE.DoubleSide })
+      )
+      floor.rotation.x = -Math.PI / 2
+      floor.position.y = -2
+      group.add(floor)
+      const grid = new THREE.GridHelper(size, 24, 0x11607a, 0x0c3a52)
+      const gmat = grid.material as THREE.LineBasicMaterial
+      gmat.transparent = true
+      gmat.opacity = 0.5
+      gmat.depthWrite = false
+      group.add(grid)
+      scene.add(group)
+      treesGroundRef.current = group
+      isDirtyRef.current = true
+    }
+    const timers = [setTimeout(buildGround, 1500), setTimeout(buildGround, 5000), setTimeout(buildGround, 12000)]
+    return () => { timers.forEach(clearTimeout); removeGround() }
+    // treeBranches dep: resizes the slab when the spread slider rescales the forest
+  }, [graphShape, treeBranches])
+
+  // Trees branch skeleton — trunk + branch lines from worker-computed segments,
+  // drawn as glowing lines so each folder tree reads as an actual tree
+  const treeBranchLinesRef = useRef<THREE.LineSegments | null>(null)
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene) return
+    const removeLines = () => {
+      if (treeBranchLinesRef.current) {
+        scene.remove(treeBranchLinesRef.current)
+        treeBranchLinesRef.current.geometry.dispose()
+        ;(treeBranchLinesRef.current.material as THREE.Material).dispose()
+        treeBranchLinesRef.current = null
+      }
+    }
+    removeLines()
+    if (graphShape !== 'trees' || !treeBranches || treeBranches.length === 0) {
+      isDirtyRef.current = true
+      return
+    }
+    const pos = new Float32Array(treeBranches.length * 6)
+    treeBranches.forEach((s, i) => {
+      pos[i * 6] = s.ax; pos[i * 6 + 1] = s.ay; pos[i * 6 + 2] = s.az
+      pos[i * 6 + 3] = s.bx; pos[i * 6 + 4] = s.by; pos[i * 6 + 5] = s.bz
+    })
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x2fae7d, // bioluminescent branch green — distinct from cyan note links
+      transparent: true,
+      opacity: 0.85,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    })
+    const lines = new THREE.LineSegments(geo, mat)
+    scene.add(lines)
+    treeBranchLinesRef.current = lines
+    isDirtyRef.current = true
+    return removeLines
+  }, [treeBranches, graphShape])
+
+  // Trees base labels — folder name floating at each trunk foot, so every tree
+  // is identifiable even when the folder has no index/moc note to anchor it
+  const treeLabelSpritesRef = useRef<THREE.Sprite[]>([])
+  useEffect(() => {
+    const scene = sceneRef.current
+    if (!scene) return
+    const removeLabels = () => {
+      for (const s of treeLabelSpritesRef.current) {
+        scene.remove(s)
+        ;(s.material as THREE.SpriteMaterial).map?.dispose()
+        s.material.dispose()
+      }
+      treeLabelSpritesRef.current = []
+    }
+    removeLabels()
+    if (graphShape !== 'trees' || !treeLabels || treeLabels.length === 0) {
+      isDirtyRef.current = true
+      return
+    }
+    for (const l of treeLabels) {
+      const sprite = createLabelSprite(l.text)
+      // Honour the current TEXT SIZE slider on creation (the textSize effect
+      // rescales these live thereafter). 110×20.6 is the folder-label base.
+      sprite.scale.set(110 * textSizeRef.current, 20.6 * textSizeRef.current, 1)
+      sprite.position.set(l.x, l.y, l.z)
+      scene.add(sprite)
+      treeLabelSpritesRef.current.push(sprite)
+    }
+    isDirtyRef.current = true
+    return removeLabels
+  }, [treeLabels, graphShape])
+
+  // PERF: Split into two effects — heavy structural work (matrix/links/labels) only runs on
+  // position/filter/size changes; lightweight color/interaction work runs on hover/selection.
+  // This avoids iterating 9600 labels on every mouse-move hover event.
+
+  // Effect 1: Structural updates — matrix, visibility tracking, link geometry, labels, bounding sphere
+  useEffect(() => {
+    const mesh = instancedMeshRef.current
+    const lines = lineSegmentsRef.current
+    if (!mesh || !lines || positions.size === 0 || !graphData) return
+
+    const dummy = new THREE.Object3D()
+    const nodes = graphData.nodes
+
+    // Detect which changes occurred — skip expensive matrix+link updates when only
+    // position data changed (handled by RAF lerp loop at 60fps)
+    const positionsChanged = positions !== lastPositionsRef.current
+    const visibleNodesChanged = visibleNodes !== lastVisibleNodesRef.current
+    const sizeChanged =
+      minNodeSize !== lastSizeParamsRef.current.minNodeSize ||
+      maxNodeSize !== lastSizeParamsRef.current.maxNodeSize ||
+      ultraNodeSize !== lastSizeParamsRef.current.ultraNodeSize
+    const filtersChanged =
+      timeFilterIds !== lastFiltersRef.current.timeFilterIds ||
+      tagIsolationIds !== lastFiltersRef.current.tagIsolationIds ||
+      focusModeNodeIds !== lastFiltersRef.current.focusModeNodeIds
+    // Matrix update needed for visibility/size/filter changes, or initial application.
+    const needsMatrixUpdate = (!hasAppliedMatricesRef.current && displayedPositionsRef.current.size > 0) || visibleNodesChanged || sizeChanged || filtersChanged
+
+    if (needsMatrixUpdate) {
+      hasAppliedMatricesRef.current = true
+    }
+    if (positionsChanged || needsMatrixUpdate) {
+      lastPositionsRef.current = positions
+      lastVisibleNodesRef.current = visibleNodes
+      lastSizeParamsRef.current = { minNodeSize, maxNodeSize, ultraNodeSize }
+      lastFiltersRef.current = { timeFilterIds, tagIsolationIds, focusModeNodeIds }
+    }
+
+    const newVisibleSet = new Set<string>()
+    if (!visibleFlagsRef.current || visibleFlagsRef.current.length !== nodes.length) {
+      visibleFlagsRef.current = new Uint8Array(nodes.length)
+    }
+    const visFlags = visibleFlagsRef.current
+
+    nodes.forEach((node, i) => {
+      const dPos = displayedPositionsRef.current.get(node.id)
+      if (!dPos) {
+        visFlags[i] = 0
+        return
+      }
+
+      const inTimeFilter = !timeFilterIds || timeFilterIds.has(node.id)
+      const isVisible = visibleNodes.has(node.id)
+      const inTagIsolation = !tagIsolationIds || tagIsolationIds.has(node.id)
+      const inFocusMode = !focusModeNodeIds || focusModeNodeIds.has(node.id)
+      const visible = inTimeFilter && isVisible && inTagIsolation && inFocusMode
+
+      visFlags[i] = visible ? 1 : 0
+      if (visible) newVisibleSet.add(node.id)
+
+      if (needsMatrixUpdate) {
+        const tier = simPositionsRef.current.get(node.id)?.tier ?? 'regular'
+        const sizeMultiplier = tier === 'ultranode' ? ultraNodeSize : tier === 'supernode' ? maxNodeSize : minNodeSize
+
+        // Entrance animation: detect nodes newly revealed by time filter
+        const wasVisible = visibleForAnimRef.current.has(node.id)
+        if (timeFilterActive && visible && !wasVisible) {
+          entranceAnimsRef.current.set(node.id, performance.now())
+        }
+
+        const isAnimating = entranceAnimsRef.current.has(node.id)
+        if (!isAnimating) {
+          const scale = visible ? sizeMultiplier : 0
+          dummy.position.set(dPos.x, dPos.y, dPos.z)
+          dummy.scale.set(scale, scale, scale)
+          dummy.updateMatrix()
+          mesh.setMatrixAt(i, dummy.matrix)
+        } else {
+          dummy.position.set(dPos.x, dPos.y, dPos.z)
+          dummy.scale.set(0, 0, 0)
+          dummy.updateMatrix()
+          mesh.setMatrixAt(i, dummy.matrix)
+        }
+      }
+    })
+
+    // Update visibility tracking for entrance animation detection and RAF lerp loop
+    visibleForAnimRef.current = newVisibleSet
+    liveVisibleSetRef.current = newVisibleSet
+
+    if (needsMatrixUpdate) mesh.instanceMatrix.needsUpdate = true
+
+    // Link geometry — in-place BufferAttribute update; zero GC pressure
+    if (needsMatrixUpdate) {
+      const displayed = displayedPositionsRef.current
+      const posArray = (lines.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array
+      graphData.links.forEach((link, i) => {
+        const srcId = typeof link.source === 'string' ? link.source : (link.source as GraphNode).id
+        const dstId = typeof link.target === 'string' ? link.target : (link.target as GraphNode).id
+        const src = displayed.get(srcId)
+        const dst = displayed.get(dstId)
+
+        const srcVisible = visibleNodes.has(srcId) && (!timeFilterIds || timeFilterIds.has(srcId)) && (!tagIsolationIds || tagIsolationIds.has(srcId)) && (!focusModeNodeIds || focusModeNodeIds.has(srcId))
+        const dstVisible = visibleNodes.has(dstId) && (!timeFilterIds || timeFilterIds.has(dstId)) && (!tagIsolationIds || tagIsolationIds.has(dstId)) && (!focusModeNodeIds || focusModeNodeIds.has(dstId))
+        const linkVisible = srcVisible && dstVisible
+
+        if (src && dst && linkVisible) {
+          posArray[i * 6] = src.x; posArray[i * 6 + 1] = src.y; posArray[i * 6 + 2] = src.z
+          posArray[i * 6 + 3] = dst.x; posArray[i * 6 + 4] = dst.y; posArray[i * 6 + 5] = dst.z
+        } else {
+          for (let k = 0; k < 6; k++) posArray[i * 6 + k] = 0
+        }
+      })
+      ;(lines.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true
+    }
+
+    // Lazy label sprites — allocate CanvasTexture only when node first becomes visible
+    // with labelsEnabled on. Label positions updated by RAF lerp loop for smooth motion.
+    const labelScene = sceneRef.current
+    for (const node of nodes) {
+      const nodeId = node.id
+      const dPos = displayedPositionsRef.current.get(nodeId)
+      if (!dPos) continue
+      const inTagIso = !tagIsolationIds || tagIsolationIds.has(nodeId)
+      const inTimeF = !timeFilterIds || timeFilterIds.has(nodeId)
+      const inFocusM = !focusModeNodeIds || focusModeNodeIds.has(nodeId)
+      const shouldShow = labelsEnabled && inTimeF && visibleNodes.has(nodeId) && inTagIso && inFocusM
+      let sprite = labelsMapRef.current.get(nodeId)
+      if (!sprite && shouldShow && labelScene) {
+        sprite = createLabelSprite(node.label)
+        sprite.scale.set(40 * textSizeRef.current, 7.5 * textSizeRef.current, 1)
+        sprite.visible = false
+        labelScene.add(sprite)
+        labelsMapRef.current.set(nodeId, sprite)
+      }
+      if (!sprite) continue
+      if (needsMatrixUpdate) {
+        sprite.position.set(dPos.x, dPos.y + NODE_RADIUS * 3, dPos.z)
+      }
+      sprite.visible = shouldShow
+    }
+
+    // Throttled: clamp controls.maxDistance to bounding sphere fit (at most every 2s)
+    const nowMs = Date.now()
+    if (nowMs - lastMaxDistUpdateRef.current > 2000 || lastMaxDistUpdateRef.current === 0) {
+      lastMaxDistUpdateRef.current = nowMs
+      const bsPts: THREE.Vector3[] = []
+      for (const [, p] of displayedPositionsRef.current) {
+        // Skip non-finite positions — one NaN makes the sphere NaN, which would
+        // scale the starfield and camera max-distance to NaN and black the view.
+        if (Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z)) bsPts.push(new THREE.Vector3(p.x, p.y, p.z))
+      }
+      if (bsPts.length > 0 && controlsRef.current && cameraRef.current) {
+        const bsBox = new THREE.Box3().setFromPoints(bsPts)
+        const bsSphere = new THREE.Sphere()
+        bsBox.getBoundingSphere(bsSphere)
+        const fovRad = cameraRef.current.fov * Math.PI / 180
+        // Star shell scales with SPREAD (the intended zoom control), NOT the live
+        // bounding sphere — so MIN DISTANCE re-spacing never moves the stars. Default
+        // spread 4.0 → scale 1 (matches the old base look); larger spread recedes the
+        // shell so the camera stays immersed inside it.
+        {
+          const s = Math.max(1, spreadRef.current / 4.0)
+          starsRef.current?.scale.setScalar(s)
+          for (const g of galaxySpritesRef.current) (g as unknown as THREE.Object3D).scale.setScalar(s)
+        }
+        // Fit maxDistance to the NODE extent (NOT the star shell) so zoom-out stops at the
+        // graph and the view stays immersed inside the surrounding star sphere.
+        controlsRef.current.maxDistance = (bsSphere.radius * 1.1) / Math.tan(fovRad / 2)
+      }
+    }
+
+    isDirtyRef.current = true
+  }, [positions, graphData, visibleNodes, minNodeSize, maxNodeSize, ultraNodeSize, timeFilterIds, tagIsolationIds, focusModeNodeIds, labelsEnabled, timeFilterActive])
+
+  // Effect 2: Color/interaction updates — lightweight, runs on hover/selection/search/opacity changes.
+  // Avoids triggering heavy matrix/link/label work on every mouse-move hover event.
+  useEffect(() => {
+    const mesh = instancedMeshRef.current
+    const lines = lineSegmentsRef.current
+    if (!mesh || !lines || !graphData) return
+
+    const color = new THREE.Color()
+    const nodes = graphData.nodes
+
+    nodes.forEach((node, i) => {
+      const inTimeFilter = !timeFilterIds || timeFilterIds.has(node.id)
+      const inSearch = !searchResults || searchResults.includes(node.id)
+      const isVisible = visibleNodes.has(node.id)
+      const inTagIsolation = !tagIsolationIds || tagIsolationIds.has(node.id)
+      const inFocusMode = !focusModeNodeIds || focusModeNodeIds.has(node.id)
+      const visible = inTimeFilter && isVisible && inTagIsolation && inFocusMode
+
+      // Skip animating nodes — RAF loop handles their brightness
+      if (entranceAnimsRef.current.has(node.id)) return
+
+      const baseColor = node.id === flashNodeId
+        ? 0xffffff
+        : getNodeColor(node.type, node.folder)
+
+      const opacity = !inSearch && searchResults !== null
+        ? 0.1
+        : (visible ? nodeOpacity : 0)
+
+      color.set(baseColor).multiplyScalar(opacity > 0 ? 1 : 0)
+      if (node.id === hoveredNodeId) color.set(baseColor).multiplyScalar(1.5)
+      mesh.setColorAt(i, color)
+    })
+
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+
+    // Link fade opacity
+    const linkFade = graphShape === 'milkyway' ? 0.15 : graphShape === 'saturn' ? 0.3 : 0.6
+    ;(lines.material as THREE.LineBasicMaterial).opacity = nodeOpacity * linkFade
+
+    // Node material opacity
+    ;(mesh.material as THREE.MeshBasicMaterial).opacity = nodeOpacity
+
+    // Highlight overlay: connected edges when a node is selected
+    const hlLines = selectedEdgeLinesRef.current
+    if (hlLines) {
+      if (selectedNodeId) {
+        const displayed = displayedPositionsRef.current
+        const hlPos = (hlLines.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array
+        let hlCount = 0
+        graphData.links.forEach((link) => {
+          const srcId = typeof link.source === 'string' ? link.source : (link.source as GraphNode).id
+          const dstId = typeof link.target === 'string' ? link.target : (link.target as GraphNode).id
+          if (srcId !== selectedNodeId && dstId !== selectedNodeId) return
+          const src = displayed.get(srcId); const dst = displayed.get(dstId)
+          if (!src || !dst) return
+          const base = hlCount * 6
+          hlPos[base]=src.x; hlPos[base+1]=src.y; hlPos[base+2]=src.z
+          hlPos[base+3]=dst.x; hlPos[base+4]=dst.y; hlPos[base+5]=dst.z
+          hlCount++
+        })
+        ;(hlLines.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true
+        hlLines.geometry.setDrawRange(0, hlCount * 2)
+      } else {
+        hlLines.geometry.setDrawRange(0, 0)
+      }
+    }
+
+    // Update selected node bracket and title sprite positions
+    if (selectedNodeId) {
+      const selPos = displayedPositionsRef.current.get(selectedNodeId)
+      if (selPos) {
+        if (selectedBracketRef.current?.visible) {
+          selectedBracketRef.current.position.set(selPos.x, selPos.y, selPos.z)
+        }
+        if (selectedTitleSpriteRef.current?.visible) {
+          selectedTitleSpriteRef.current.position.set(selPos.x, selPos.y + NODE_RADIUS * 5.5, selPos.z)
+        }
+      }
+    }
+
+    isDirtyRef.current = true
+  }, [graphData, hoveredNodeId, selectedNodeId, searchResults, nodeOpacity, flashNodeId, visibleNodes, timeFilterIds, tagIsolationIds, focusModeNodeIds, graphShape])
+
+  // Animate loop
+  useEffect(() => {
+    const composer = composerRef.current
+    const controls = controlsRef.current
+    if (!composer || !controls) {
+      console.warn('[Graph3D] RAF loop skipped — composer:', !!composer, 'controls:', !!controls, 'sceneReady:', sceneReady)
+      return
+    }
+    console.debug('[Graph3D] RAF loop started — sceneReady:', sceneReady)
+
+    // PERF: dirty-flag render gate — saves ~60 renderer.render() calls/sec when sim stable and
+    // camera is at rest. OrbitControls fires 'change' on every camera move (user input + damping
+    // decay), so damping continues rendering until it fully settles with no extra logic needed.
+    const onControlsChange = () => { isDirtyRef.current = true }
+    controls.addEventListener('change', onControlsChange)
+
+    let animId: number
+    let renderCount = 0
+    const localControls = controls
+    const localComposer = composer
+
+    // Reusable objects for entrance animation and lerp (avoid per-frame allocation)
+    const animDummy = new THREE.Object3D()
+    const animColor = new THREE.Color()
+    const SCALE_DUR = 600  // ms — scale 0 → 1
+    const GLOW_DUR = 800   // ms — emissive brightness spike → base
+    const LERP_FACTOR = 0.08 // Lower = smoother/more fluid, higher = snappier. At 3fps sim + 60fps render, 0.08 gives ~40 interpolated frames between ticks
+    const LERP_EPSILON_SQ = 0.01 // Squared distance threshold for convergence
+
+    // RAF loop — uncapped, targets display refresh rate (60Hz/120Hz/144Hz).
+    // No manual throttling. Dirty-flag gate skips render when scene is unchanged.
+    function loop() {
+      animId = requestAnimationFrame(loop)
+
+      if (DEBUG) {
+        // Stutter tracking: rAF interval measured unconditionally (before the dirty gate),
+        // so main-thread stalls show up even on frames where rendering is skipped
+        const rafNow = performance.now()
+        if (lastRafTsRef.current > 0) {
+          const buf = rafIntervalsRef.current
+          buf.push(rafNow - lastRafTsRef.current)
+          if (buf.length > 300) buf.shift()
+        }
+        lastRafTsRef.current = rafNow
+      }
+
+      // Auto-rotate (ported from casberry's OrbitControls autoRotate, speed 2.0 ≈ 30s/orbit):
+      // orbit the camera about the target around world-Y, rotating up with it so the
+      // trackball's free orientation is preserved. Paused while the user drags.
+      if (autoRotateRef.current && !userInteractingRef.current) {
+        const cam = cameraRef.current
+        if (cam) {
+          autoRotOffset.subVectors(cam.position, localControls.target).applyAxisAngle(AUTO_ROTATE_AXIS, AUTO_ROTATE_ANGLE)
+          cam.position.copy(localControls.target).add(autoRotOffset)
+          cam.up.applyAxisAngle(AUTO_ROTATE_AXIS, AUTO_ROTATE_ANGLE)
+        }
+      }
+
+      // PERF: controls.update() runs every frame to advance damping; the 'change' event fires
+      // automatically during damping decay, keeping isDirtyRef true until camera fully settles
+      localControls.update()
+
+      // Trees: turntable camera — whatever TrackballControls did, re-project onto
+      // a fixed-elevation cone around the target: mouse rotation becomes pure
+      // horizontal orbit, the plane tilt never changes, and the camera can never
+      // go under the plane.
+      if (graphShapeRef.current === 'trees') {
+        const cam = cameraRef.current
+        if (cam) {
+          const t = localControls.target
+          const ox = cam.position.x - t.x
+          const oy = cam.position.y - t.y
+          const oz = cam.position.z - t.z
+          const r = Math.sqrt(ox * ox + oy * oy + oz * oz)
+          if (r > 1e-3) {
+            const azim = Math.atan2(ox, oz)
+            const cosE = Math.cos(TREES_ELEV_RAD)
+            const sinE = Math.sin(TREES_ELEV_RAD)
+            cam.position.set(t.x + r * cosE * Math.sin(azim), t.y + r * sinE, t.z + r * cosE * Math.cos(azim))
+            cam.up.set(0, 1, 0)
+            cam.lookAt(t)
+          }
+        }
+      }
+
+      // Spread-aware zoom-out: Spread animates via this RAF loop (not React state), so the
+      // effect-based maxDistance clamp goes stale and you couldn't zoom out after raising
+      // Spread (had to Reset View). Re-fit maxDistance to the live NODE extent here (so you
+      // can zoom out to fit the spread-scaled graph), throttled ~500ms; expand-only so it
+      // never fights a zoom-in. Fit is the node extent (NOT the star shell) so the view stays
+      // INSIDE the surrounding star sphere; the 2s effect resets it on spread-down.
+      {
+        const nowMd = performance.now()
+        if (nowMd - lastMaxDistRafRef.current > 500) {
+          lastMaxDistRafRef.current = nowMd
+          const cam = cameraRef.current
+          const dm = displayedPositionsRef.current
+          if (cam && dm.size > 0) {
+            let maxR2 = 0
+            for (const [, p] of dm) { const r2 = p.x * p.x + p.y * p.y + p.z * p.z; if (r2 > maxR2) maxR2 = r2 }
+            const fit = (Math.sqrt(maxR2) * 1.15) / Math.tan((cam.fov * Math.PI / 180) / 2)
+            if (fit > localControls.maxDistance) localControls.maxDistance = fit
+          }
+        }
+      }
+
+      // P1/P2: pull latest sim positions from the live binary channel. React is not
+      // involved — the worker message handler bumps live.version and this loop picks
+      // it up on the next frame.
+      const live = livePositions?.current
+      {
+        const gData = graphDataRef.current
+        if (live?.arr && gData && live.ids.length === gData.nodes.length &&
+            live.arr.length === gData.nodes.length * 3 &&
+            live.version !== lastLiveVersionRef.current) {
+          lastLiveVersionRef.current = live.version
+          // (Re)build displayed-position objects after a graphData change, snapping to
+          // targets. The objects are shared with displayedPositionsRef (id-keyed) so
+          // raycasting, proximity, labels and drag all see lerped positions for free.
+          if (displayedObjsRef.current.length !== gData.nodes.length) {
+            const objs = new Array<{ x: number; y: number; z: number }>(gData.nodes.length)
+            const map = displayedPositionsRef.current
+            map.clear()
+            for (let i = 0; i < gData.nodes.length; i++) {
+              const o = { x: live.arr[i * 3], y: live.arr[i * 3 + 1], z: live.arr[i * 3 + 2] }
+              objs[i] = o
+              map.set(live.ids[i], o)
+            }
+            displayedObjsRef.current = objs
+          }
+          isLerpingRef.current = true
+          isDirtyRef.current = true
+        }
+      }
+
+      // Position interpolation: lerp displayed positions toward sim targets at 60fps —
+      // pure index math over the typed array, no Map lookups or per-frame allocation
+      if (isLerpingRef.current) {
+        const mesh = instancedMeshRef.current
+        const gData = graphDataRef.current
+        const lines = lineSegmentsRef.current
+        const liveArr = live?.arr ?? null
+        const dObjs = displayedObjsRef.current
+        if (mesh && gData && liveArr && dObjs.length === gData.nodes.length) {
+          const { minNodeSize: mnSize, maxNodeSize: mxSize, ultraNodeSize: ulSize } = liveNodeSizeRef.current
+          const tiers = live?.tiers ?? []
+          const visFlags = visibleFlagsRef.current
+          const nodes = gData.nodes
+          let maxDelta = 0
+
+          for (let i = 0; i < nodes.length; i++) {
+            // Skip nodes currently in entrance animation (RAF animation block handles them)
+            if (entranceAnimsRef.current.has(nodes[i].id)) continue
+
+            const current = dObjs[i]
+            const tx = liveArr[i * 3]
+            const ty = liveArr[i * 3 + 1]
+            const tz = liveArr[i * 3 + 2]
+
+            // Lerp each axis
+            current.x += (tx - current.x) * LERP_FACTOR
+            current.y += (ty - current.y) * LERP_FACTOR
+            current.z += (tz - current.z) * LERP_FACTOR
+
+            // Track max delta for convergence check
+            const dx = tx - current.x
+            const dy = ty - current.y
+            const dz = tz - current.z
+            const deltaSq = dx * dx + dy * dy + dz * dz
+            if (deltaSq > maxDelta) maxDelta = deltaSq
+
+            // Apply to mesh matrix (respect visibility — don't resurrect hidden nodes)
+            const visible = visFlags ? visFlags[i] === 1 : liveVisibleSetRef.current.has(nodes[i].id)
+            const tier = tiers[i] ?? 'regular'
+            const size = visible ? (tier === 'ultranode' ? ulSize : tier === 'supernode' ? mxSize : mnSize) : 0
+            animDummy.position.set(current.x, current.y, current.z)
+            animDummy.scale.set(size, size, size)
+            animDummy.updateMatrix()
+            mesh.setMatrixAt(i, animDummy.matrix)
+          }
+
+          mesh.instanceMatrix.needsUpdate = true
+
+          // Update link geometry to match lerped positions (index pairs, no id lookups)
+          const pairs = linkIndexPairsRef.current
+          if (lines && pairs) {
+            const posArray = (lines.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array
+            const linkCount = pairs.length / 2
+            for (let li = 0; li < linkCount; li++) {
+              const si = pairs[li * 2]
+              const di = pairs[li * 2 + 1]
+              // Only show link if BOTH endpoints are visible (respects focus mode, time filter, tag isolation)
+              if (si >= 0 && di >= 0 && visFlags && visFlags[si] === 1 && visFlags[di] === 1) {
+                const s = dObjs[si]
+                const d = dObjs[di]
+                posArray[li * 6] = s.x; posArray[li * 6 + 1] = s.y; posArray[li * 6 + 2] = s.z
+                posArray[li * 6 + 3] = d.x; posArray[li * 6 + 4] = d.y; posArray[li * 6 + 5] = d.z
+              } else {
+                // Zero out hidden links so they don't render
+                posArray[li * 6] = 0; posArray[li * 6 + 1] = 0; posArray[li * 6 + 2] = 0
+                posArray[li * 6 + 3] = 0; posArray[li * 6 + 4] = 0; posArray[li * 6 + 5] = 0
+              }
+            }
+            ;(lines.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true
+          }
+
+          // Update label positions to track interpolated nodes
+          if (labelsMapRef.current.size > 0) {
+            const displayedMap = displayedPositionsRef.current
+            for (const [nodeId, sprite] of labelsMapRef.current) {
+              if (!sprite.visible) continue
+              const dPos = displayedMap.get(nodeId)
+              if (dPos) sprite.position.set(dPos.x, dPos.y + NODE_RADIUS * 3, dPos.z)
+            }
+          }
+
+          // Update selected bracket/title to follow lerped position
+          if (selectedBracketRef.current?.visible || selectedTitleSpriteRef.current?.visible) {
+            const selPos = displayedPositionsRef.current.get(selectedNodeIdRef.current ?? '')
+            if (selPos) {
+              if (selectedBracketRef.current?.visible) {
+                selectedBracketRef.current.position.set(selPos.x, selPos.y, selPos.z)
+              }
+              if (selectedTitleSpriteRef.current?.visible) {
+                selectedTitleSpriteRef.current.position.set(selPos.x, selPos.y + NODE_RADIUS * 5.5, selPos.z)
+              }
+            }
+          }
+
+          isDirtyRef.current = true
+
+          // Stop lerping when all nodes have converged
+          if (maxDelta < LERP_EPSILON_SQ) {
+            isLerpingRef.current = false
+          }
+        }
+      }
+
+      // Process node entrance animations (time-lapse reveal)
+      const anims = entranceAnimsRef.current
+      const mesh = instancedMeshRef.current
+      const gData = graphDataRef.current
+      if (anims.size > 0 && mesh && gData) {
+        const now = performance.now()
+        const toDelete: string[] = []
+        const { minNodeSize: mnSize, maxNodeSize: mxSize, ultraNodeSize: ulSize } = liveNodeSizeRef.current
+
+        for (const [nodeId, startTime] of anims) {
+          const elapsed = now - startTime
+          const idx = nodeIndexMapRef.current.get(nodeId)
+          if (idx === undefined) { toDelete.push(nodeId); continue }
+
+          const dPos = displayedPositionsRef.current.get(nodeId)
+          if (!dPos) continue
+
+          const tier = simPositionsRef.current.get(nodeId)?.tier ?? 'regular'
+          const baseSizeMult = tier === 'ultranode' ? ulSize : tier === 'supernode' ? mxSize : mnSize
+          const node = gData.nodes[idx]
+
+          if (elapsed >= Math.max(SCALE_DUR, GLOW_DUR)) {
+            // Animation complete — restore final state and remove
+            animDummy.position.set(dPos.x, dPos.y, dPos.z)
+            animDummy.scale.set(baseSizeMult, baseSizeMult, baseSizeMult)
+            animDummy.updateMatrix()
+            mesh.setMatrixAt(idx, animDummy.matrix)
+            animColor.set(getNodeColor(node.type, node.folder))
+            mesh.setColorAt(idx, animColor)
+            toDelete.push(nodeId)
+            continue
+          }
+
+          // Scale: ease-out cubic 0 → baseSizeMult over SCALE_DUR
+          const st = Math.min(elapsed / SCALE_DUR, 1)
+          const scaleT = 1 - Math.pow(1 - st, 3)
+          animDummy.position.set(dPos.x, dPos.y, dPos.z)
+          animDummy.scale.set(scaleT * baseSizeMult, scaleT * baseSizeMult, scaleT * baseSizeMult)
+          animDummy.updateMatrix()
+          mesh.setMatrixAt(idx, animDummy.matrix)
+
+          // Glow burst: brightness spike decays from 2.7× to 1× over GLOW_DUR
+          const gt = Math.min(elapsed / GLOW_DUR, 1)
+          const brightnessMult = 1 + 1.7 * (1 - gt)
+          animColor.set(getNodeColor(node.type, node.folder)).multiplyScalar(brightnessMult)
+          mesh.setColorAt(idx, animColor)
+        }
+
+        for (const id of toDelete) anims.delete(id)
+        mesh.instanceMatrix.needsUpdate = true
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+        isDirtyRef.current = true
+      }
+
+      if (isDirtyRef.current) {
+        isDirtyRef.current = false
+        renderCount++
+
+        if (DEBUG) {
+          // --- Render FPS tracking ---
+          const renderNow = performance.now()
+          const rfps = renderFpsTimesRef.current
+          rfps.push(renderNow)
+          while (rfps.length > 0 && renderNow - rfps[0] > 1000) rfps.shift()
+
+          // --- Bloom cost profiling: time composer.render() (includes bloom) ---
+          const t0 = performance.now()
+          localComposer.render()
+          const composerMs = performance.now() - t0
+
+          // Track render time rolling average (last 60 frames)
+          const rms = renderMsSamplesRef.current
+          rms.push(composerMs)
+          if (rms.length > 60) rms.shift()
+
+          // Bloom cost delta: estimate from composer time vs baseline (no extra render pass
+          // which was causing visible flash). Just track composer time as bloom cost when enabled.
+          if (bloomPassRef.current?.enabled) {
+            const bcs = bloomCostSamplesRef.current
+            bcs.push(composerMs)
+            if (bcs.length > 20) bcs.shift()
+          }
+
+          // Update perf HUD every 15 frames
+          if (renderCount % 15 === 0) {
+            const hud = perfHudRef.current
+            if (hud) {
+              const avgRenderMs = rms.reduce((a, b) => a + b, 0) / rms.length
+              const avgBloomCost = bloomCostSamplesRef.current.length > 0
+                ? bloomCostSamplesRef.current.reduce((a, b) => a + b, 0) / bloomCostSamplesRef.current.length
+                : 0
+              const simMetrics = simPerfRef?.current
+              // Stutter stats from rAF intervals (last ~300 frames)
+              const ints = rafIntervalsRef.current
+              const sortedInts = [...ints].sort((a, b) => a - b)
+              const p95Int = sortedInts.length > 0
+                ? sortedInts[Math.min(sortedInts.length - 1, Math.ceil(0.95 * sortedInts.length) - 1)]
+                : 0
+              const maxInt = sortedInts.length > 0 ? sortedInts[sortedInts.length - 1] : 0
+              let longFrames = 0
+              for (const d of ints) if (d > 25) longFrames++
+              hud.textContent = [
+                `Render FPS: ${rfps.length}`,
+                `Sim FPS: ${simMetrics?.simFps ?? 0}`,
+                `Frame: ${avgRenderMs.toFixed(1)}ms`,
+                `Bloom Δ: ${avgBloomCost.toFixed(1)}ms`,
+                `W→M latency: ${(simMetrics?.workerLatencyMs ?? 0).toFixed(1)}ms`,
+                `Movement: ${(simMetrics?.avgMovement ?? 0).toFixed(2)}`,
+                `rAF p95: ${p95Int.toFixed(1)}ms  max: ${maxInt.toFixed(1)}ms`,
+                `Long frames >25ms: ${longFrames}/${ints.length}`,
+              ].join('\n')
+            }
+          }
+        } else {
+          localComposer.render()
+        }
+
+        // Periodic draw-call profiling (only in dev with ?perf flag)
+        if (DEBUG && renderCount % 60 === 0) {
+          const r = rendererRef.current
+          if (r) console.debug(`[perf] renders=${renderCount} drawCalls=${r.info.render.calls} triangles=${r.info.render.triangles} programs=${r.info.programs?.length ?? 0}`)
+        }
+      }
+    }
+    animId = requestAnimationFrame(loop)
+    frameRef.current = animId
+    return () => {
+      cancelAnimationFrame(animId)
+      controls.removeEventListener('change', onControlsChange)
+    }
+  }, [sceneReady])
+
+  // Mouse interaction
+  const raycasterRef = useRef(new THREE.Raycaster())
+  const mouseRef = useRef(new THREE.Vector2())
+
+  const getHitNode = useCallback((e: React.MouseEvent): { node: GraphNode; index: number } | null => {
+    const canvas = canvasRef.current
+    const camera = cameraRef.current
+    const mesh = instancedMeshRef.current
+    if (!canvas || !camera || !mesh || !graphData) return null
+
+    const rect = canvas.getBoundingClientRect()
+    mouseRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+    mouseRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+
+    raycasterRef.current.setFromCamera(mouseRef.current, camera)
+    raycasterRef.current.params.Points = { threshold: 10 }
+
+    const hits = raycasterRef.current.intersectObject(mesh)
+    if (!hits.length) return null
+
+    const instanceId = hits[0].instanceId
+    if (instanceId === undefined) return null
+
+    const node = graphData.nodes[instanceId]
+    if (!node || !visibleNodes.has(node.id)) return null
+    if (tagIsolationIds && !tagIsolationIds.has(node.id)) return null
+    if (timeFilterIds && !timeFilterIds.has(node.id)) return null
+    return { node, index: instanceId }
+  }, [graphData, visibleNodes, tagIsolationIds, timeFilterIds])
+
+  // Apply right-drag overrides directly to Three.js objects
+  const applyRightDragToScene = useCallback(() => {
+    const drag = rightDragRef.current
+    if (!drag?.active || !graphData) return
+    const mesh = instancedMeshRef.current
+    const lines = lineSegmentsRef.current
+    if (!mesh) return
+
+    const dummy = new THREE.Object3D()
+    for (const nodeId of drag.nodeIds) {
+      const idx = nodeIndexMapRef.current.get(nodeId)
+      const pos = drag.overridePositions.get(nodeId)
+      if (idx === undefined || !pos) continue
+      mesh.getMatrixAt(idx, dummy.matrix)
+      dummy.matrix.decompose(dummy.position, dummy.quaternion, dummy.scale)
+      dummy.position.set(pos.x, pos.y, pos.z)
+      dummy.updateMatrix()
+      mesh.setMatrixAt(idx, dummy.matrix)
+    }
+    mesh.instanceMatrix.needsUpdate = true
+
+    // Update only the dragged node's links via the per-node link index lists —
+    // avoids scanning every link with id compares on each mousemove
+    const pairs = linkIndexPairsRef.current
+    if (lines && pairs) {
+      const posArray = (lines.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array
+      const gNodes = graphData.nodes
+      let touched = false
+      for (const nodeId of drag.nodeIds) {
+        const linkIdxs = linksByNodeRef.current.get(nodeId)
+        if (!linkIdxs) continue
+        for (const li of linkIdxs) {
+          const si = pairs[li * 2]
+          const di = pairs[li * 2 + 1]
+          if (si < 0 || di < 0) continue
+          const srcPos = drag.overridePositions.get(gNodes[si].id) ?? displayedPositionsRef.current.get(gNodes[si].id)
+          const dstPos = drag.overridePositions.get(gNodes[di].id) ?? displayedPositionsRef.current.get(gNodes[di].id)
+          if (!srcPos || !dstPos) continue
+          posArray[li * 6] = srcPos.x; posArray[li * 6 + 1] = srcPos.y; posArray[li * 6 + 2] = srcPos.z
+          posArray[li * 6 + 3] = dstPos.x; posArray[li * 6 + 4] = dstPos.y; posArray[li * 6 + 5] = dstPos.z
+          touched = true
+        }
+      }
+      if (touched) {
+        ;(lines.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true
+      }
+    }
+  }, [graphData])
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    // Handle right-drag — pure 2D screen-space movement (no depth bleed)
+    const drag = rightDragRef.current
+    if (drag?.active && (e.buttons & 2)) {
+      const camera = cameraRef.current
+      const canvas = canvasRef.current
+      if (!camera || !canvas) return
+
+      // Screen delta (pixels)
+      const sdx = e.clientX - drag.lastScreenX
+      const sdy = e.clientY - drag.lastScreenY
+      drag.lastScreenX = e.clientX
+      drag.lastScreenY = e.clientY
+
+      // World units per pixel: perspective scale at node's depth
+      const primaryId = drag.nodeIds[0]
+      const primaryPos = drag.overridePositions.get(primaryId) ?? drag.nodeStartPositions.get(primaryId)
+      if (!primaryPos) return
+
+      const nodeVec = new THREE.Vector3(primaryPos.x, primaryPos.y, primaryPos.z)
+      const dist = camera.position.distanceTo(nodeVec)
+      const fovRad = (camera as THREE.PerspectiveCamera).fov * Math.PI / 180
+      const scale = (2 * dist * Math.tan(fovRad / 2)) / canvas.clientHeight
+
+      // Camera right/up vectors (columns 0 and 1 of camera world matrix)
+      // Moving along these is always perpendicular to camera view = zero depth change
+      const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0)
+      const up    = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1)
+
+      const wx = right.x * sdx * scale + up.x * (-sdy) * scale
+      const wy = right.y * sdx * scale + up.y * (-sdy) * scale
+      const wz = right.z * sdx * scale + up.z * (-sdy) * scale
+
+      const op = drag.overridePositions.get(primaryId)
+      if (op) { op.x += wx; op.y += wy; op.z += wz }
+
+      applyRightDragToScene()
+      // P3: coalesce sim sync to one worker message per frame — mousemove fires at
+      // 125–1000Hz and each moveNodes message reheats the sim, so per-event sends
+      // flooded the channel and caused drag stutter
+      pendingMoveRef.current = drag.nodeIds.map(id => {
+        const p = drag.overridePositions.get(id)!
+        return { id, x: p.x, y: p.y, z: p.z }
+      })
+      if (moveRafRef.current === null) {
+        moveRafRef.current = requestAnimationFrame(() => {
+          moveRafRef.current = null
+          if (pendingMoveRef.current) {
+            onMoveNodes?.(pendingMoveRef.current)
+            pendingMoveRef.current = null
+          }
+        })
+      }
+      return
+    }
+
+    const hit = getHitNode(e)
+    if (hit) {
+      // Direct hit: hide the proximity annotation line so it can't linger stale
+      if (annotLineRef.current?.visible) {
+        annotLineRef.current.visible = false
+        isDirtyRef.current = true
+      }
+      onNodeHover(hit.node, e.clientX, e.clientY)
+      return
+    }
+
+    // Proximity detection: find nearest node in screen space within 80px threshold
+    const camera = cameraRef.current
+    const canvas = canvasRef.current
+    if (!camera || !canvas || !graphData) {
+      onNodeHover(null, 0, 0)
+      return
+    }
+
+    const rect = canvas.getBoundingClientRect()
+    const THRESHOLD = 80
+    let nearestNode: GraphNode | null = null
+    let minDist = THRESHOLD
+
+    for (const node of graphData.nodes) {
+      if (!visibleNodes.has(node.id)) continue
+      if (tagIsolationIds && !tagIsolationIds.has(node.id)) continue
+      if (timeFilterIds && !timeFilterIds.has(node.id)) continue
+      const pos = displayedPositionsRef.current.get(node.id)
+      if (!pos) continue
+
+      projRef.current.set(pos.x, pos.y, pos.z).project(camera)
+      if (projRef.current.z > 1) continue // behind camera
+
+      const screenX = (projRef.current.x + 1) / 2 * rect.width + rect.left
+      const screenY = (-projRef.current.y + 1) / 2 * rect.height + rect.top
+      const dx = e.clientX - screenX
+      const dy = e.clientY - screenY
+      const dist = Math.sqrt(dx * dx + dy * dy)
+
+      if (dist < minDist) {
+        minDist = dist
+        nearestNode = node
+      }
+    }
+
+    proximityNodeRef.current = nearestNode
+
+    // Update annotation line: cursor world pos → nearest node
+    const annotLine = annotLineRef.current
+    if (annotLine) {
+      if (nearestNode) {
+        const nodePos = displayedPositionsRef.current.get(nearestNode.id)
+        if (nodePos && camera && canvas) {
+          const nr = canvas.getBoundingClientRect()
+          const mx = ((e.clientX - nr.left) / nr.width) * 2 - 1
+          const my = -((e.clientY - nr.top) / nr.height) * 2 + 1
+          raycasterRef.current.setFromCamera(new THREE.Vector2(mx, my), camera)
+          const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -nodePos.z)
+          const cursor3D = new THREE.Vector3()
+          raycasterRef.current.ray.intersectPlane(plane, cursor3D)
+          const pts = (annotLine.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array
+          pts[0] = cursor3D.x; pts[1] = cursor3D.y; pts[2] = cursor3D.z
+          pts[3] = nodePos.x; pts[4] = nodePos.y; pts[5] = nodePos.z
+          ;(annotLine.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true
+          annotLine.visible = true
+        }
+      } else {
+        annotLine.visible = false
+      }
+      // Mark the frame dirty so the line renders even when nothing else does —
+      // with links hidden (trees default) an idle scene has no other render
+      // trigger and the annotation would appear stale or not at all
+      isDirtyRef.current = true
+    }
+
+    onNodeHover(nearestNode, e.clientX, e.clientY)
+  }, [getHitNode, onNodeHover, graphData, visibleNodes, tagIsolationIds, timeFilterIds, applyRightDragToScene, onMoveNodes])
+
+  const handleClick = useCallback((e: React.MouseEvent) => {
+    // Ignore if this was a drag (mouse moved > 5px from mousedown position)
+    const dx = e.clientX - mouseDownPosRef.current.x
+    const dy = e.clientY - mouseDownPosRef.current.y
+    if (dx * dx + dy * dy > 25) return
+
+    const hit = getHitNode(e)
+    const now = Date.now()
+
+    if (!hit) {
+      // Fallback: open proximity-previewed note if one is active
+      const prox = proximityNodeRef.current
+      if (prox) {
+        lastClickTimeRef.current = now
+        lastClickNodeRef.current = prox.id
+        onNodeClick(prox)
+      }
+      return
+    }
+
+    const isDouble = now - lastClickTimeRef.current < 350 && lastClickNodeRef.current === hit.node.id
+    lastClickTimeRef.current = now
+    lastClickNodeRef.current = hit.node.id
+
+    if (isDouble) {
+      onNodeDoubleClick(hit.node)
+    } else {
+      onNodeClick(hit.node)
+    }
+  }, [getHitNode, onNodeClick, onNodeDoubleClick])
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault() // suppress browser context menu; right-drag is handled in onMouseDown
+  }, [])
+
+  // flyTo handler
+  const flyTo = useCallback((nodeId: string) => {
+    const camera = cameraRef.current
+    const controls = controlsRef.current
+    const pos = positions.get(nodeId)
+    if (!camera || !controls || !pos) return
+
+    const target = new THREE.Vector3(pos.x, pos.y, pos.z)
+    const startPos = camera.position.clone()
+    const startTarget = controls.target.clone()
+    const endPos = new THREE.Vector3(pos.x, pos.y, pos.z + 159)
+
+    let t = 0
+    const duration = 600
+    const start = performance.now()
+
+    const localCamera = camera
+    const localControls = controls
+    function animFly(now: number) {
+      t = Math.min((now - start) / duration, 1)
+      const ease = 1 - Math.pow(1 - t, 3)
+      localCamera.position.lerpVectors(startPos, endPos, ease)
+      localControls.target.lerpVectors(startTarget, target, ease)
+      localControls.update()
+      if (t < 1) requestAnimationFrame(animFly)
+    }
+    requestAnimationFrame(animFly)
+  }, [positions])
+
+  // resetCamera handler — fit all nodes in view using bounding box centroid
+  const resetCamera = useCallback(() => {
+    const camera = cameraRef.current
+    const controls = controlsRef.current
+    if (!camera || !controls) return
+
+    // Compute bounding sphere of all node positions. Skip any non-finite
+    // position: a single NaN makes Box3/Sphere NaN (silently — no THREE warning),
+    // which sets camera.position to NaN and blacks out the whole view.
+    const pts: THREE.Vector3[] = []
+    for (const [, pos] of displayedPositionsRef.current) {
+      if (Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z)) {
+        pts.push(new THREE.Vector3(pos.x, pos.y, pos.z))
+      }
+    }
+
+    // Compute actual centroid of all node positions
+    const endTarget = new THREE.Vector3()
+    let dist = 600
+    if (pts.length > 0) {
+      let cx = 0, cy = 0, cz = 0
+      for (const p of pts) { cx += p.x; cy += p.y; cz += p.z }
+      cx /= pts.length; cy /= pts.length; cz /= pts.length
+      endTarget.set(cx, cy, cz)
+
+      if (graphShape === 'milkyway') {
+        // Use 80th percentile distance from centroid — excludes orphan outliers
+        const dists = pts.map(p => p.distanceTo(endTarget)).sort((a, b) => a - b)
+        const p80 = dists[Math.floor(dists.length * 0.80)] || 600
+        const fov = camera.fov * Math.PI / 180
+        dist = (p80 * 2.0) / Math.tan(fov / 2)
+      } else {
+        const box = new THREE.Box3().setFromPoints(pts)
+        const sphere = new THREE.Sphere()
+        box.getBoundingSphere(sphere)
+        const fov = camera.fov * Math.PI / 180
+        dist = (sphere.radius * 1.4) / Math.tan(fov / 2)
+        if (graphShape === 'trees') {
+          // Target the centre of the ground plane (geometric bounds), not the
+          // centre of mass — the biggest tree would drag the view toward itself
+          box.getCenter(endTarget)
+        }
+      }
+    }
+    controls.maxDistance = 500000
+    // Shape-specific camera angles
+    let endPos: THREE.Vector3
+    if (graphShape === 'milkyway') {
+      // 50° above XZ plane — see spiral structure from above
+      const angle = 50 * Math.PI / 180
+      endPos = new THREE.Vector3(
+        endTarget.x,
+        endTarget.y + dist * Math.sin(angle),
+        endTarget.z + dist * Math.cos(angle)
+      )
+    } else if (graphShape === 'saturn') {
+      // 40° above ring plane — dramatic tilt view showing ring as tilted ellipse
+      const angle = 40 * Math.PI / 180
+      endPos = new THREE.Vector3(
+        endTarget.x,
+        endTarget.y + dist * Math.sin(angle),
+        endTarget.z + dist * Math.cos(angle)
+      )
+    } else if (graphShape === 'brain') {
+      // 15° from the side — medical diagram view
+      const angle = 15 * Math.PI / 180
+      endPos = new THREE.Vector3(
+        endTarget.x + dist * Math.cos(angle),
+        endTarget.y + dist * Math.sin(angle) * 0.3,
+        endTarget.z + dist * 0.1
+      )
+    } else if (graphShape === 'trees') {
+      // Horizontal plane, camera tilted only slightly toward it — tree profiles
+      // stay readable while the ground plane recedes with a hint of depth.
+      // Same fixed elevation the RAF turntable enforces.
+      endPos = new THREE.Vector3(
+        endTarget.x,
+        endTarget.y + dist * Math.sin(TREES_ELEV_RAD),
+        endTarget.z + dist * Math.cos(TREES_ELEV_RAD)
+      )
+    } else if (graphShape === 'tagboxes') {
+      // Straight-on front view — flat grid layout, slight elevation
+      endPos = new THREE.Vector3(endTarget.x, endTarget.y + dist * 0.15, endTarget.z + dist)
+    } else {
+      endPos = new THREE.Vector3(endTarget.x, endTarget.y, endTarget.z + dist)
+    }
+
+    const startPos = camera.position.clone()
+    const startTarget = controls.target.clone()
+    // TrackballControls rolls camera.up during free tumbling — reset must level
+    // the horizon too, or the "reset" view keeps the old roll and the ground
+    // plane comes back tilted. Nudge a fully-inverted up so the lerp can't
+    // degenerate through the zero vector.
+    const startUp = camera.up.clone().normalize()
+    const endUp = new THREE.Vector3(0, 1, 0)
+    if (startUp.dot(endUp) < -0.99) startUp.x += 0.05
+    const duration = 500
+    const start = performance.now()
+
+    const localCamera = camera
+    const localControls = controls
+    function animReset(now: number) {
+      const t = Math.min((now - start) / duration, 1)
+      const ease = 1 - Math.pow(1 - t, 3)
+      localCamera.position.lerpVectors(startPos, endPos, ease)
+      localCamera.up.lerpVectors(startUp, endUp, ease).normalize()
+      localControls.target.lerpVectors(startTarget, endTarget, ease)
+      localControls.update()
+      if (t < 1) requestAnimationFrame(animReset)
+    }
+    requestAnimationFrame(animReset)
+  }, [graphShape])
+
+  useImperativeHandle(ref, () => ({
+    flyTo,
+    resetCamera,
+    reheat: () => {},
+    getScene: () => sceneRef.current,
+    getCamera: () => cameraRef.current,
+    getCameraPosition: () => {
+      const controls = controlsRef.current
+      if (!controls) return new THREE.Vector3()
+      return controls.object.position.clone()
+    },
+    getCameraTarget: () => {
+      const controls = controlsRef.current
+      if (!controls) return new THREE.Vector3()
+      return controls.target.clone()
+    },
+    panCameraTo: (x: number, z: number) => {
+      const controls = controlsRef.current
+      if (!controls) return
+      const camera = controls.object
+      const target = controls.target
+      const dx = x - target.x
+      const dz = z - target.z
+      camera.position.x += dx
+      camera.position.z += dz
+      target.x = x
+      target.z = z
+      controls.update()
+    },
+  }), [flyTo, resetCamera])
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    mouseDownPosRef.current = { x: e.clientX, y: e.clientY }
+
+    if (e.button === 2 && graphData) {
+      // Right-click: find closest node via proximity detection and start drag
+      const camera = cameraRef.current
+      const canvas = canvasRef.current
+      if (!camera || !canvas) return
+
+      const rect = canvas.getBoundingClientRect()
+      const THRESHOLD = 80
+      let nearestNode: GraphNode | null = null
+      let minDist = THRESHOLD
+
+      for (const node of graphData.nodes) {
+        if (!visibleNodes.has(node.id)) continue
+        if (tagIsolationIds && !tagIsolationIds.has(node.id)) continue
+        if (timeFilterIds && !timeFilterIds.has(node.id)) continue
+        const pos = displayedPositionsRef.current.get(node.id)
+        if (!pos) continue
+        projRef.current.set(pos.x, pos.y, pos.z).project(camera)
+        if (projRef.current.z > 1) continue
+        const screenX = (projRef.current.x + 1) / 2 * rect.width + rect.left
+        const screenY = (-projRef.current.y + 1) / 2 * rect.height + rect.top
+        const dist = Math.sqrt((e.clientX - screenX) ** 2 + (e.clientY - screenY) ** 2)
+        if (dist < minDist) { minDist = dist; nearestNode = node }
+      }
+
+      if (!nearestNode) return
+
+      // Only drag the grabbed node — connected nodes follow naturally via sim link forces
+      const primaryPos = displayedPositionsRef.current.get(nearestNode.id)
+      if (!primaryPos) return
+
+      const overridePositions = new Map<string, { x: number; y: number; z: number }>()
+      overridePositions.set(nearestNode.id, { x: primaryPos.x, y: primaryPos.y, z: primaryPos.z })
+
+      rightDragRef.current = {
+        active: true,
+        nodeIds: [nearestNode.id],
+        nodeStartPositions: new Map([[nearestNode.id, { x: primaryPos.x, y: primaryPos.y, z: primaryPos.z }]]),
+        overridePositions,
+        lastScreenX: e.clientX,
+        lastScreenY: e.clientY,
+      }
+
+      // Pin only the grabbed node; sim link forces pull connected nodes naturally
+      onPinNodes?.([{ id: nearestNode.id, x: primaryPos.x, y: primaryPos.y, z: primaryPos.z }])
+
+      // Brightness boost for dragged cluster
+      const mesh = instancedMeshRef.current
+      if (mesh) {
+        const color = new THREE.Color()
+        for (const nodeId of [nearestNode.id]) {
+          const idx = nodeIndexMapRef.current.get(nodeId)
+          if (idx === undefined) continue
+          const node = graphData.nodes[idx]
+          if (!node) continue
+          color.set(getNodeColor(node.type, node.folder)).multiplyScalar(2.0)
+          mesh.setColorAt(idx, color)
+        }
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+      }
+    }
+  }, [graphData, visibleNodes, tagIsolationIds, timeFilterIds, onPinNodes])
+
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    const drag = rightDragRef.current
+    if (drag?.active && e.button === 2) {
+      // Flush any coalesced move so the sim pins the node at the exact drop position
+      if (moveRafRef.current !== null) {
+        cancelAnimationFrame(moveRafRef.current)
+        moveRafRef.current = null
+      }
+      if (pendingMoveRef.current) {
+        onMoveNodes?.(pendingMoveRef.current)
+        pendingMoveRef.current = null
+      }
+      // Restore normal colours and clear drag state
+      const mesh = instancedMeshRef.current
+      if (mesh && graphData) {
+        const color = new THREE.Color()
+        for (const nodeId of drag.nodeIds) {
+          const idx = nodeIndexMapRef.current.get(nodeId)
+          if (idx === undefined) continue
+          const node = graphData.nodes[idx]
+          if (!node) continue
+          color.set(getNodeColor(node.type, node.folder))
+          mesh.setColorAt(idx, color)
+        }
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+      }
+      // Release pinned nodes in sim — let forces settle from final drag position
+      onUnpinNodes?.(drag.nodeIds)
+      rightDragRef.current = null
+    }
+  }, [graphData, onUnpinNodes, onMoveNodes])
+
+  return (
+    <>
+      <canvas
+        ref={canvasRef}
+        style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair' }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        onMouseLeave={() => {
+          proximityNodeRef.current = null
+          if (annotLineRef.current) annotLineRef.current.visible = false
+          onNodeHover(null, 0, 0)
+          // Clear any active right-drag on mouse leave
+          if (rightDragRef.current?.active) {
+            rightDragRef.current = null
+          }
+        }}
+      />
+      {DEBUG && (
+        <div
+          ref={perfHudRef}
+          style={{
+            position: 'absolute',
+            top: 8,
+            left: 8,
+            background: 'rgba(0,0,0,0.75)',
+            color: '#0ff',
+            fontFamily: '"Courier New", monospace',
+            fontSize: 11,
+            padding: '6px 10px',
+            borderRadius: 4,
+            pointerEvents: 'none',
+            whiteSpace: 'pre',
+            zIndex: 1000,
+            border: '1px solid rgba(0,255,255,0.2)',
+          }}
+        >
+          Perf HUD loading...
+        </div>
+      )}
+    </>
+  )
+})
+
+Graph3D.displayName = 'Graph3D'

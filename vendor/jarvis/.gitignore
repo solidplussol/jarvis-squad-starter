@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.env
+*.log
+memory/
+PRD.md
+docs/
+.cc-*.md
+*.png
+*.jpg
+test-results/
+!screenshots/
+!screenshots/*.png
+brain-mesh.glb
+brain-vertices.json
+semantic-screenshot.js
+ultranode-screenshots.js
+
+# Rust/WASM build artifacts (prebuilt force_sim.wasm is committed in src/workers/)
+wasm/force-sim/target/
