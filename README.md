@@ -118,6 +118,43 @@ Agent field. The built-in agents (scribe, ralph, rai, fact-checker) show only if
 ## Optional usage panel
 Optional and OFF by default: a read-only "USAGE" panel in the Jarvis Mission view showing recorded token usage from the local Copilot session store. It is local-only on purpose: Jarvis stays read-only, holds no credentials or tokens, makes no outbound calls and reads two fixed allow-listed files (the opt-in flag and the summary) written by a user-run script. No GitHub billing/spend data is included. Turn on with `.local\usage-panel.json` containing `{"enabled": true}` and run `node scripts\usage-summary.mjs` (Node 24 recommended). Details, variables, extension rules and turn-off steps: `docs\integrations\jarvis-usage-panel.md`.
 
+## Going further: Obsidian and an LLM wiki (optional)
+Not needed for the quick start, and **not tested in this project**. It is a suggestion for people who
+want to learn more, using the Squad as a guide.
+
+**The idea.** Andrej Karpathy describes an "LLM Wiki" (also called LLM Knowledge Bases): instead of
+re-searching raw documents on every question (RAG), an LLM incrementally builds and maintains a
+wiki of linked Markdown files. Three layers: **raw sources** (your immutable articles, papers,
+images), **the wiki** (LLM-written Markdown: summaries, concept pages, backlinks, an index) and a
+**schema** (a file of rules telling the LLM how to maintain the wiki). The LLM does the writing and
+bookkeeping; you choose sources and ask questions. Obsidian is the viewer ("the IDE").
+
+**Install Obsidian.**
+1. Download it from https://obsidian.md/download and install it.
+2. Create a **new vault in a folder outside this repo**, for example `Documents\my-llm-wiki`.
+3. Optional: the Obsidian Web Clipper browser extension (https://obsidian.md/clipper) saves web
+   articles into the vault as Markdown.
+
+**Ask the Squad to guide you.** In the Squad session:
+```
+Explain Karpathy's LLM Wiki idea in plain terms and how Obsidian fits in
+Help me set up a new Obsidian vault for an LLM wiki, outside this repo
+Draft a folder structure (raw/, wiki/) and a schema file with rules for maintaining the wiki
+Show me how to add a first source and update the wiki from it
+```
+
+**Keep these in mind.**
+- This repo's Jarvis project mode is locked to `demo-vault` on purpose, so it cannot read your own
+  vault. Open your new vault in Obsidian itself. Do not point project-mode Jarvis at it.
+- Keep private notes out of this repo and out of anything you publish.
+- LLM-written notes can be wrong. Keep raw sources, and review what the LLM writes.
+
+**Read more.**
+- Karpathy, "LLM Wiki" idea file (the pattern in detail): https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+- Karpathy, "LLM Knowledge Bases" post on X (Apr 2, 2026): https://x.com/karpathy/status/2039805659525644595
+- Obsidian: https://obsidian.md/
+- Add your own articles and guides here as you find them.
+
 ## Limitations
 - The roster comes from `.squad\team.md`; the `docs/status/<id>.md` layout is fixed in the Jarvis code.
 - The vault path must be set (`JARVIS_PROJECT_VAULT`) and must be exactly this repo's `demo-vault`;
