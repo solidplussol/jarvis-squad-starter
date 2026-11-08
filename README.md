@@ -21,8 +21,8 @@ Five steps: clone, install, start Squad, create your team by prompting, launch J
 
 ### 1. Clone the repo
 ```powershell
-git clone <this-repo-url>
-cd <repo-folder>
+git clone https://github.com/solidplussol/jarvis-squad-starter.git
+cd jarvis-squad-starter
 ```
 
 ### 2. Install
